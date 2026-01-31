@@ -1,0 +1,12 @@
+{
+  "name": "chiba-cable",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Monorepo for the Chiba Cable guide + control server",
+  "scripts": {
+    "dev": "sh -c 'trap \"kill 0\" EXIT; pnpm -C apps/server dev & pnpm -C apps/guide dev'",
+    "dev:guide": "pnpm -C apps/guide dev",
+    "build:guide": "pnpm -C apps/guide build",
+    "dev:server": "pnpm -C apps/server dev"
+  }
+}
