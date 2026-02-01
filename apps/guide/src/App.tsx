@@ -46,6 +46,23 @@ type PlayerMeta = {
   callSign?: string;
 };
 
+type MediaDebugStats = {
+  uptimeSec: number;
+  active: number;
+  requests: number;
+  completed: number;
+  bytesSent: number;
+  bytesRequested: number;
+  errors: number;
+  lastRequestAt?: number | null;
+  topPaths?: Array<{
+    path: string;
+    requests: number;
+    bytes: number;
+    lastAt: number;
+  }>;
+};
+
 type MediaKind = "image" | "video" | "audio" | "iframe";
 
 type PreloadEntry = {
@@ -88,10 +105,21 @@ type RemoteControl =
 type RemoteMessage =
   | { type: "nav"; dir: "up" | "down" | "left" | "right" }
   | { type: "channel"; dir: "up" | "down" }
+  | { type: "tune"; number: string }
+  | { type: "dial"; value: string; committed?: boolean }
   | { type: "select" }
   | { type: "guide" }
   | { type: "info" }
   | { type: "app"; appId?: string | null }
+  | { type: "index" }
+  | {
+      type: "now";
+      channelId?: string;
+      number?: string;
+      title?: string;
+      url?: string;
+    }
+  | { type: "godselect"; channelId: string; url: string }
   | { type: "controls"; appId: string; controls: RemoteControl[] }
   | {
       type: "control";
@@ -104,10 +132,29 @@ const USER_PAUSE_MS = 6500;
 const ROW_HEIGHT = 76;
 const ROW_GAP = 12;
 const AUTO_SCROLL_PX_PER_SEC = 14;
+const AUTO_SCROLL_END_HOLD_MS = 2200;
+const VISIBLE_HOURS = 3;
 const PRELOAD_DEBOUNCE_MS = 320;
 const PRELOAD_AFTER_PLAY_MS = 1200;
 const PRELOAD_CACHE_TTL_MS = 3 * 60 * 1000;
 const PRELOAD_CACHE_LIMIT = 4;
+const DEBUG_CHANNEL_ID = "debug";
+const DEBUG_CHANNEL_NUMBER = "026";
+const GODMODE_CHANNEL_ID = "godmode";
+const GODMODE_CHANNEL_NUMBER = "067";
+
+function isHiddenChannel(channel: GuideChannel): boolean {
+  if (!channel) return false;
+  const number = normalizeChannelNumber(channel.number ?? "");
+  return (
+    channel.id === GODMODE_CHANNEL_ID ||
+    channel.id === DEBUG_CHANNEL_ID ||
+    number === normalizeChannelNumber(GODMODE_CHANNEL_NUMBER) ||
+    number === normalizeChannelNumber(DEBUG_CHANNEL_NUMBER)
+  );
+}
+const DIAL_OVERLAY_IDLE_MS = 1200;
+const DIAL_OVERLAY_COMMIT_MS = 1800;
 
 const fallbackIndex: GuideIndex = {
   generatedAt: Date.now(),
@@ -187,8 +234,66 @@ const fallbackIndex: GuideIndex = {
   ],
 };
 
+function ensureDebugChannel(indexData: GuideIndex): GuideIndex {
+  if (
+    indexData.channels.some(
+      (channel) =>
+        channel.id === DEBUG_CHANNEL_ID ||
+        channel.number === DEBUG_CHANNEL_NUMBER
+    )
+  ) {
+    return indexData;
+  }
+  const slotCount = Math.max(1, indexData.slotCount);
+  const schedule: ProgramSlot[] = [
+    {
+      title: "Diagnostics",
+      subtitle: "Bandwidth + health",
+      tag: "DEBUG",
+      start: 0,
+      span: slotCount,
+      end: slotCount - 1,
+      durationSec: slotCount * indexData.slotMinutes * 60,
+    },
+  ];
+  const debugChannel: GuideChannel = {
+    id: DEBUG_CHANNEL_ID,
+    number: DEBUG_CHANNEL_NUMBER,
+    name: "Debug",
+    callSign: "DBG",
+    description: "Performance and media load.",
+    accent: "#8fa7ff",
+    previewUrl: "",
+    schedule,
+  };
+  const channels = [...indexData.channels];
+  const insertAt = channels.findIndex((channel) => {
+    const number = normalizeChannelNumber(channel.number);
+    return number !== null && number > 26;
+  });
+  if (insertAt === -1) {
+    channels.push(debugChannel);
+  } else {
+    channels.splice(insertAt, 0, debugChannel);
+  }
+  return {
+    ...indexData,
+    channels,
+  };
+}
+
+function ensureSystemChannels(indexData: GuideIndex): GuideIndex {
+  return ensureDebugChannel(indexData);
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function normalizeChannelNumber(value: string): number | null {
+  if (!value) return null;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function getMediaKind(url: string): MediaKind {
@@ -245,6 +350,8 @@ function useRemoteSocket(onMessage?: (msg: RemoteMessage) => void) {
     "connecting"
   );
   const socketRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const retryRef = useRef(0);
   const handlerRef = useRef(onMessage);
 
   useEffect(() => {
@@ -252,25 +359,58 @@ function useRemoteSocket(onMessage?: (msg: RemoteMessage) => void) {
   }, [onMessage]);
 
   useEffect(() => {
-    const url = getWsUrl();
-    const socket = new WebSocket(url);
-    socketRef.current = socket;
-    setStatus("connecting");
+    let cancelled = false;
+    const connect = () => {
+      if (cancelled) return;
+      const url = getWsUrl();
+      const socket = new WebSocket(url);
+      socketRef.current = socket;
+      setStatus("connecting");
 
-    socket.addEventListener("open", () => setStatus("open"));
-    socket.addEventListener("close", () => setStatus("closed"));
-    socket.addEventListener("error", () => setStatus("closed"));
-    socket.addEventListener("message", (event) => {
-      try {
-        const parsed = JSON.parse(event.data) as RemoteMessage;
-        handlerRef.current?.(parsed);
-      } catch {
-        // ignore
-      }
-    });
+      socket.addEventListener("open", () => {
+        if (cancelled) return;
+        retryRef.current = 0;
+        setStatus("open");
+      });
+      socket.addEventListener("close", () => {
+        if (cancelled) return;
+        setStatus("closed");
+        scheduleReconnect();
+      });
+      socket.addEventListener("error", () => {
+        if (cancelled) return;
+        setStatus("closed");
+        scheduleReconnect();
+      });
+      socket.addEventListener("message", (event) => {
+        try {
+          const parsed = JSON.parse(event.data) as RemoteMessage;
+          handlerRef.current?.(parsed);
+        } catch {
+          // ignore
+        }
+      });
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimerRef.current !== null) return;
+      const attempt = retryRef.current + 1;
+      retryRef.current = attempt;
+      const delay = Math.min(1000 * 2 ** attempt, 10000);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, delay);
+    };
+
+    connect();
 
     return () => {
-      socket.close();
+      cancelled = true;
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+      }
+      socketRef.current?.close();
     };
   }, []);
 
@@ -298,9 +438,19 @@ function App() {
   const requestedRemoteAppId = params.get("app") ?? params.get("appId") ?? "";
 
   const [now, setNow] = useState(() => new Date());
-  const [indexData, setIndexData] = useState<GuideIndex>(fallbackIndex);
+  const [indexData, setIndexData] = useState<GuideIndex>(() =>
+    ensureSystemChannels(fallbackIndex)
+  );
   const slotCount = indexData.timeSlots.length;
-  const channels = indexData.channels;
+  const visibleSlotCount = useMemo(() => {
+    const minutes = Math.max(1, indexData.slotMinutes);
+    return Math.max(1, Math.round((VISIBLE_HOURS * 60) / minutes));
+  }, [indexData.slotMinutes]);
+  const allChannels = indexData.channels;
+  const channels = useMemo(
+    () => allChannels.filter((channel) => !isHiddenChannel(channel)),
+    [allChannels]
+  );
   const currentSlotIndex = useMemo(
     () =>
       getCurrentSlotIndex(
@@ -311,6 +461,7 @@ function App() {
       ),
     [now, indexData.startTime, indexData.slotMinutes, slotCount]
   );
+  const [visibleStartSlot, setVisibleStartSlot] = useState(0);
 
   const [selectedRow, setSelectedRow] = useState(0);
   const [selectedCol, setSelectedCol] = useState(0);
@@ -329,23 +480,35 @@ function App() {
     null
   );
   const [preloadTick, setPreloadTick] = useState(0);
-  const [hasPreviewIframe, setHasPreviewIframe] = useState(false);
+  const [hasPreviewMedia, setHasPreviewMedia] = useState(false);
+  const [posterImageReady, setPosterImageReady] = useState(false);
   const [showDebug, setShowDebug] = useState(false);
   const [memoryStats, setMemoryStats] = useState<{
     used: number;
     total: number;
     limit: number;
   } | null>(null);
+  const [mediaStats, setMediaStats] = useState<MediaDebugStats | null>(null);
+  const [remoteGodmodeOpen, setRemoteGodmodeOpen] = useState(false);
+  const [remoteNowChannel, setRemoteNowChannel] = useState<{
+    id?: string;
+    number?: string;
+    title?: string;
+    url?: string;
+  } | null>(null);
+  const [godmodeQuery, setGodmodeQuery] = useState("");
+  const [dialOverlay, setDialOverlay] = useState("");
+  const [dialBuffer, setDialBuffer] = useState("");
   const [remoteControls, setRemoteControls] = useState<RemoteControl[]>([]);
   const [remoteControlsStatus, setRemoteControlsStatus] = useState<
     "idle" | "loading" | "ready" | "missing"
   >("idle");
   const [activeRemoteAppId, setActiveRemoteAppId] =
     useState(requestedRemoteAppId);
-  const [remotePanel, setRemotePanel] =
-    useState<"remote" | "app">("remote");
+  const [remotePanel, setRemotePanel] = useState<"remote" | "app">("remote");
 
   const pauseUntilRef = useRef(0);
+  const autoHoldUntilRef = useRef(0);
   const lastFrameRef = useRef<number | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const preloadTimerRef = useRef<number | null>(null);
@@ -356,7 +519,11 @@ function App() {
   const preloadCacheRef = useRef<Map<string, PreloadEntry>>(new Map());
   const preloadContainerRef = useRef<HTMLDivElement | null>(null);
   const previewContainerRef = useRef<HTMLDivElement | null>(null);
-  const previewAttachedRef = useRef<HTMLIFrameElement | null>(null);
+  const previewAttachedRef = useRef<HTMLElement | null>(null);
+  const lastCurrentSlotRef = useRef<number>(currentSlotIndex);
+  const dialTimeoutRef = useRef<number | null>(null);
+  const sendRef = useRef<((msg: RemoteMessage) => void) | null>(null);
+  const dialOverlayTimerRef = useRef<number | null>(null);
 
   const moveSelection = useCallback(
     (dir: "up" | "down" | "left" | "right") => {
@@ -379,7 +546,8 @@ function App() {
           );
           const idx = currentIdx >= 0 ? currentIdx : 0;
           const nextIdx = Math.max(idx - 1, 0);
-          return schedule[nextIdx]?.start ?? prev;
+          const target = schedule[nextIdx]?.start ?? prev;
+          return Math.max(target, currentSlotIndex);
         });
       }
       if (dir === "right") {
@@ -396,7 +564,7 @@ function App() {
         });
       }
     },
-    [channels, selectedRow]
+    [channels, selectedRow, currentSlotIndex]
   );
 
   const isPaused = Date.now() < pauseUntilRef.current;
@@ -412,6 +580,70 @@ function App() {
     () => (playerUrl ? getMediaKind(playerUrl) : null),
     [playerUrl]
   );
+  const godmodeItems = useMemo(() => {
+    const items: Array<{
+      id: string;
+      program: ProgramSlot;
+      channel: GuideChannel;
+    }> = [];
+    const seen = new Set<string>();
+    channels.forEach((channel) => {
+      if (channel.id === GODMODE_CHANNEL_ID) return;
+      channel.schedule.forEach((program, index) => {
+        if (!program.url) return;
+        const key = `${program.url}|${program.title ?? ""}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        items.push({
+          id: `${channel.id}-${index}`,
+          program,
+          channel,
+        });
+      });
+    });
+    return items;
+  }, [channels]);
+  const filteredGodmodeItems = useMemo(() => {
+    const query = godmodeQuery.trim().toLowerCase();
+    if (!query) return godmodeItems;
+    return godmodeItems.filter((item) => {
+      const haystack = [
+        item.program.title,
+        item.program.subtitle,
+        item.channel.name,
+        item.channel.callSign,
+        item.channel.number,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(query);
+    });
+  }, [godmodeItems, godmodeQuery]);
+
+  const getProgramForChannel = useCallback(
+    (channel: GuideChannel | undefined) => {
+      if (!channel) return null;
+      return (
+        channel.schedule.find(
+          (slot) =>
+            currentSlotIndex >= slot.start && currentSlotIndex <= slot.end
+        ) ?? channel.schedule[0]
+      );
+    },
+    [currentSlotIndex]
+  );
+
+  const showDialOverlay = useCallback((value: string, holdMs: number) => {
+    if (!value) return;
+    setDialOverlay(value);
+    if (dialOverlayTimerRef.current) {
+      window.clearTimeout(dialOverlayTimerRef.current);
+    }
+    dialOverlayTimerRef.current = window.setTimeout(() => {
+      setDialOverlay("");
+    }, holdMs);
+  }, []);
 
   const formatMb = useCallback((bytes: number) => {
     if (!Number.isFinite(bytes)) return "n/a";
@@ -572,7 +804,7 @@ function App() {
         setPlayerReady(false);
         setPlayerUrl(program.url);
       }
-      setShowPlayerHud(true);
+      setShowPlayerHud(false);
       const channelIndex = channels.findIndex((item) => item.id === channel.id);
       setPlayerChannelIndex(channelIndex >= 0 ? channelIndex : activeRow);
       setPlayerMeta({
@@ -580,6 +812,13 @@ function App() {
         subtitle: program.subtitle,
         channelName: channel.name,
         callSign: channel.callSign,
+      });
+      sendRef.current?.({
+        type: "now",
+        channelId: channel.id,
+        number: channel.number,
+        title: program.title,
+        url: program.url,
       });
     },
     [playerUrl, channels, activeRow]
@@ -591,49 +830,178 @@ function App() {
       const delta = dir === "up" ? -1 : 1;
       const nextRow = (activeRow + delta + channels.length) % channels.length;
       const nextChannel = channels[nextRow];
-      const nextProgram =
-        nextChannel?.schedule.find(
-          (slot) =>
-            currentSlotIndex >= slot.start && currentSlotIndex <= slot.end
-        ) ?? nextChannel?.schedule[0];
       setSelectedRow(nextRow);
       setSelectedCol(currentSlotIndex);
       pauseUntilRef.current = Date.now() + USER_PAUSE_MS;
+      if (nextChannel?.number) {
+        showDialOverlay(nextChannel.number, DIAL_OVERLAY_COMMIT_MS);
+        sendRef.current?.({
+          type: "dial",
+          value: nextChannel.number,
+          committed: true,
+        });
+      }
+      const nextProgram = getProgramForChannel(nextChannel);
       if (nextProgram?.url && nextChannel) {
         openProgram(nextProgram, nextChannel);
       } else {
         setPlayerOpen(false);
+        if (nextChannel) {
+          sendRef.current?.({
+            type: "now",
+            channelId: nextChannel.id,
+            number: nextChannel.number,
+            title: nextProgram?.title,
+            url: nextProgram?.url,
+          });
+        }
       }
     },
-    [channels, activeRow, currentSlotIndex, openProgram]
+    [
+      channels,
+      activeRow,
+      currentSlotIndex,
+      openProgram,
+      getProgramForChannel,
+      showDialOverlay,
+    ]
+  );
+
+  const handleTuneToNumber = useCallback(
+    (value: string) => {
+      const targetNumber = normalizeChannelNumber(value);
+      if (targetNumber === null) return;
+      if (targetNumber === normalizeChannelNumber(GODMODE_CHANNEL_NUMBER)) {
+        setPlayerOpen(false);
+        sendRef.current?.({
+          type: "now",
+          channelId: GODMODE_CHANNEL_ID,
+          number: GODMODE_CHANNEL_NUMBER,
+        });
+        return;
+      }
+      if (targetNumber === normalizeChannelNumber(DEBUG_CHANNEL_NUMBER)) {
+        setShowDebug(true);
+        setPlayerOpen(false);
+        return;
+      }
+      const targetChannel = allChannels.find((channel) => {
+        const channelNumber = normalizeChannelNumber(channel.number);
+        return channelNumber !== null && channelNumber === targetNumber;
+      });
+      if (!targetChannel) return;
+      const visibleIndex = channels.findIndex(
+        (channel) => channel.id === targetChannel.id
+      );
+      if (visibleIndex >= 0) {
+        setSelectedRow(visibleIndex);
+        setSelectedCol(currentSlotIndex);
+        pauseUntilRef.current = Date.now() + USER_PAUSE_MS;
+      }
+      const program = getProgramForChannel(targetChannel);
+      if (program?.url) {
+        openProgram(program, targetChannel);
+      } else {
+        setPlayerOpen(false);
+        sendRef.current?.({
+          type: "now",
+          channelId: targetChannel.id,
+          number: targetChannel.number,
+          title: program?.title,
+          url: program?.url,
+        });
+      }
+    },
+    [allChannels, channels, currentSlotIndex, getProgramForChannel, openProgram]
+  );
+
+  const handleGodmodePick = useCallback(
+    (program: ProgramSlot, channel: GuideChannel) => {
+      const channelIndex = channels.findIndex((item) => item.id === channel.id);
+      if (channelIndex >= 0) {
+        setSelectedRow(channelIndex);
+        setSelectedCol(program.start ?? currentSlotIndex);
+      }
+      openProgram(program, channel);
+    },
+    [channels, currentSlotIndex, openProgram]
   );
 
   const handleSelect = useCallback(() => {
-    if (!selectedChannel || !selectedProgram) return;
-    const programIndex = selectedChannel.schedule.findIndex(
-      (slot) => selectedCol >= slot.start && selectedCol <= slot.end
-    );
-    const currentProgramIndex = selectedChannel.schedule.findIndex(
-      (slot) => currentSlotIndex >= slot.start && currentSlotIndex <= slot.end
-    );
-    if (programIndex < 0 || currentProgramIndex < 0) return;
-    if (programIndex !== currentProgramIndex) return;
-    if (!selectedProgram.url) return;
-    openProgram(selectedProgram, selectedChannel);
+    if (!selectedChannel) return;
+    if (
+      selectedChannel.id === GODMODE_CHANNEL_ID ||
+      selectedChannel.number === GODMODE_CHANNEL_NUMBER
+    ) {
+      setPlayerOpen(false);
+      sendRef.current?.({
+        type: "now",
+        channelId: selectedChannel.id,
+        number: selectedChannel.number,
+      });
+      return;
+    }
+    if (
+      selectedChannel.id === DEBUG_CHANNEL_ID ||
+      selectedChannel.number === DEBUG_CHANNEL_NUMBER
+    ) {
+      setShowDebug((prev) => !prev);
+      return;
+    }
+    const currentProgram = getProgramForChannel(selectedChannel);
+    if (!currentProgram?.url) return;
+    openProgram(currentProgram, selectedChannel);
   }, [
     selectedChannel,
-    selectedProgram,
-    selectedCol,
-    currentSlotIndex,
+    getProgramForChannel,
     openProgram,
   ]);
 
+  const fetchIndex = useCallback(async () => {
+    try {
+      const res = await fetch("/api/index");
+      if (!res.ok) return;
+      const data = (await res.json()) as GuideIndex;
+      if (data.channels?.length) {
+        setIndexData(ensureSystemChannels(data));
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const { send, status } = useRemoteSocket((msg) => {
+    if (msg.type === "index") {
+      if (viewMode === "guide") {
+        void fetchIndex();
+      }
+      return;
+    }
     if (viewMode === "remote") {
       if (msg.type === "app") {
         const nextAppId = msg.appId ?? "";
         if (requestedRemoteAppId) return;
         setActiveRemoteAppId(nextAppId);
+      }
+      if (msg.type === "dial") {
+        if (msg.value) {
+          showDialOverlay(
+            msg.value,
+            msg.committed ? DIAL_OVERLAY_COMMIT_MS : DIAL_OVERLAY_IDLE_MS
+          );
+        }
+      }
+      if (msg.type === "now") {
+        setRemoteNowChannel({
+          id: msg.channelId,
+          number: msg.number,
+          title: msg.title,
+          url: msg.url,
+        });
+        const normalized = normalizeChannelNumber(msg.number ?? "");
+        setRemoteGodmodeOpen(
+          msg.channelId === GODMODE_CHANNEL_ID || normalized === 67
+        );
       }
       return;
     }
@@ -655,6 +1023,31 @@ function App() {
     if (msg.type === "info") {
       if (playerOpen) {
         setShowPlayerHud((prev) => !prev);
+      }
+      return;
+    }
+    if (msg.type === "dial") {
+      if (msg.value) {
+        showDialOverlay(
+          msg.value,
+          msg.committed ? DIAL_OVERLAY_COMMIT_MS : DIAL_OVERLAY_IDLE_MS
+        );
+      }
+      return;
+    }
+    if (msg.type === "tune") {
+      if (viewMode === "guide") {
+        handleTuneToNumber(msg.number);
+      }
+      return;
+    }
+    if (msg.type === "godselect") {
+      if (viewMode === "guide") {
+        const channel = channels.find((item) => item.id === msg.channelId);
+        const program = channel?.schedule.find((slot) => slot.url === msg.url);
+        if (channel && program) {
+          handleGodmodePick(program, channel);
+        }
       }
       return;
     }
@@ -688,6 +1081,60 @@ function App() {
     }
   });
 
+  sendRef.current = send;
+
+  const commitDial = useCallback(
+    (value: string) => {
+      if (!value) return;
+      const normalized = normalizeChannelNumber(value);
+      if (normalized === 67) {
+        setRemoteGodmodeOpen(true);
+      } else {
+        setRemoteGodmodeOpen(false);
+      }
+      send({ type: "dial", value, committed: true });
+      showDialOverlay(value, DIAL_OVERLAY_COMMIT_MS);
+      send({ type: "tune", number: value });
+      setDialBuffer("");
+    },
+    [send, showDialOverlay]
+  );
+
+  const pushDialDigit = useCallback((digit: number) => {
+    setDialBuffer((prev) => {
+      const next = `${prev}${digit}`.slice(-3);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (viewMode !== "remote") {
+      setDialBuffer("");
+      setRemoteGodmodeOpen(false);
+      setRemoteNowChannel(null);
+      setGodmodeQuery("");
+      return;
+    }
+    if (!dialBuffer) return;
+    if (dialTimeoutRef.current) {
+      window.clearTimeout(dialTimeoutRef.current);
+    }
+    send({ type: "dial", value: dialBuffer });
+    showDialOverlay(dialBuffer, DIAL_OVERLAY_IDLE_MS);
+    if (dialBuffer.length >= 3) {
+      commitDial(dialBuffer);
+      return;
+    }
+    dialTimeoutRef.current = window.setTimeout(() => {
+      commitDial(dialBuffer);
+    }, 700);
+    return () => {
+      if (dialTimeoutRef.current) {
+        window.clearTimeout(dialTimeoutRef.current);
+      }
+    };
+  }, [dialBuffer, commitDial, viewMode, send, showDialOverlay]);
+
   const mergeRemoteControls = useCallback(
     (incoming: RemoteControl[], current: RemoteControl[]) =>
       incoming.map((control) => {
@@ -717,15 +1164,15 @@ function App() {
   const gridStyle = useMemo(
     () =>
       ({
-        "--slots": slotCount,
+        "--slots": Math.min(slotCount, visibleSlotCount),
         "--row-height": `${ROW_HEIGHT}px`,
         "--row-gap": `${ROW_GAP}px`,
       } as CSSProperties),
-    [slotCount]
+    [slotCount, visibleSlotCount]
   );
 
   useEffect(() => {
-    const interval = setInterval(() => setNow(new Date()), 1000 * 30);
+    const interval = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(interval);
   }, []);
 
@@ -733,9 +1180,12 @@ function App() {
     const prev = prevViewModeRef.current;
     if (viewMode === "guide" && prev !== "guide") {
       pauseUntilRef.current = Date.now() + USER_PAUSE_MS;
+      const maxStart = Math.max(0, slotCount - visibleSlotCount);
+      setVisibleStartSlot(clamp(currentSlotIndex, 0, maxStart));
+      setSelectedCol(currentSlotIndex);
     }
     prevViewModeRef.current = viewMode;
-  }, [viewMode]);
+  }, [viewMode, currentSlotIndex, slotCount, visibleSlotCount]);
 
   useEffect(() => {
     if (!playerOpen && prevPlayerOpenRef.current) {
@@ -761,6 +1211,32 @@ function App() {
     update();
     const interval = window.setInterval(update, 1000);
     return () => window.clearInterval(interval);
+  }, [showDebug]);
+
+  useEffect(() => {
+    if (!showDebug) {
+      setMediaStats(null);
+      return;
+    }
+    let cancelled = false;
+    const fetchStats = async () => {
+      try {
+        const res = await fetch("/api/debug/media");
+        if (!res.ok) return;
+        const data = (await res.json()) as MediaDebugStats;
+        if (!cancelled) {
+          setMediaStats(data);
+        }
+      } catch {
+        // ignore
+      }
+    };
+    void fetchStats();
+    const interval = window.setInterval(fetchStats, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
   }, [showDebug]);
 
   useEffect(() => {
@@ -817,46 +1293,68 @@ function App() {
     const cacheEntry = currentUrl
       ? preloadCacheRef.current.get(currentUrl)
       : null;
-    const readyFrame =
-      cacheEntry?.kind === "iframe" && cacheEntry.status === "ready"
-        ? (cacheEntry.element as HTMLIFrameElement)
+    const readyEntry =
+      cacheEntry?.status === "ready" && cacheEntry.kind !== "audio"
+        ? cacheEntry
         : null;
+    const readyElement = readyEntry?.element ?? null;
 
-    const setHiddenStyles = (frame: HTMLIFrameElement) => {
-      frame.style.position = "absolute";
-      frame.style.left = "-9999px";
-      frame.style.top = "0";
-      frame.style.width = "1px";
-      frame.style.height = "1px";
-      frame.style.opacity = "0";
-      frame.style.pointerEvents = "none";
+    const setHiddenStyles = (element: HTMLElement) => {
+      element.style.position = "absolute";
+      element.style.left = "-9999px";
+      element.style.top = "0";
+      element.style.width = "1px";
+      element.style.height = "1px";
+      element.style.opacity = "0";
+      element.style.pointerEvents = "none";
+      if (element instanceof HTMLVideoElement) {
+        element.pause();
+      }
     };
 
-    const setPreviewStyles = (frame: HTMLIFrameElement) => {
-      frame.style.position = "absolute";
-      frame.style.left = "0";
-      frame.style.top = "0";
-      frame.style.width = "100%";
-      frame.style.height = "100%";
-      frame.style.opacity = "1";
-      frame.style.pointerEvents = "auto";
+    const setPreviewStyles = (element: HTMLElement) => {
+      element.style.position = "absolute";
+      element.style.left = "0";
+      element.style.top = "0";
+      element.style.width = "100%";
+      element.style.height = "100%";
+      element.style.opacity = "1";
+      element.style.pointerEvents = "none";
     };
 
-    if (readyFrame) {
+    if (readyElement && readyEntry) {
       if (
         previewAttachedRef.current &&
-        previewAttachedRef.current !== readyFrame
+        previewAttachedRef.current !== readyElement
       ) {
         setHiddenStyles(previewAttachedRef.current);
         cacheContainer.appendChild(previewAttachedRef.current);
       }
-      if (readyFrame.parentElement !== container) {
-        readyFrame.classList.add("poster-preview-frame");
-        setPreviewStyles(readyFrame);
-        container.appendChild(readyFrame);
+      if (readyElement.parentElement !== container) {
+        const previewClass =
+          readyEntry.kind === "iframe"
+            ? "poster-preview-frame"
+            : "poster-preview-media";
+        readyElement.classList.add(previewClass);
+        setPreviewStyles(readyElement);
+        container.appendChild(readyElement);
       }
-      previewAttachedRef.current = readyFrame;
-      setHasPreviewIframe(true);
+      if (readyEntry.kind === "video") {
+        const video = readyElement as HTMLVideoElement;
+        video.muted = true;
+        video.playsInline = true;
+        video.loop = false;
+        try {
+          if (Number.isFinite(video.duration) && video.duration > 0) {
+            video.currentTime = 0;
+          }
+        } catch {
+          // ignore seek failures on some browsers
+        }
+        video.pause();
+      }
+      previewAttachedRef.current = readyElement;
+      setHasPreviewMedia(true);
       return;
     }
 
@@ -865,7 +1363,7 @@ function App() {
       cacheContainer.appendChild(previewAttachedRef.current);
       previewAttachedRef.current = null;
     }
-    setHasPreviewIframe(false);
+    setHasPreviewMedia(false);
   }, [viewMode, selectedProgram?.url, preloadTick, ensurePreloadContainer]);
 
   useEffect(() => {
@@ -950,30 +1448,61 @@ function App() {
   useEffect(() => {
     if (!channels.length) return;
     setSelectedRow((prev) => clamp(prev, 0, channels.length - 1));
-    setSelectedCol((prev) => clamp(prev, 0, Math.max(0, slotCount - 1)));
-  }, [channels.length, slotCount]);
+    setSelectedCol((prev) =>
+      clamp(
+        Math.max(prev, currentSlotIndex),
+        0,
+        Math.max(0, slotCount - 1)
+      )
+    );
+  }, [channels.length, slotCount, currentSlotIndex]);
 
   useEffect(() => {
-    let cancelled = false;
-    const fetchIndex = async () => {
-      try {
-        const res = await fetch("/api/index");
-        if (!res.ok) return;
-        const data = (await res.json()) as GuideIndex;
-        if (!cancelled && data.channels?.length) {
-          setIndexData(data);
-        }
-      } catch {
-        // ignore
-      }
-    };
-    fetchIndex();
-    const interval = window.setInterval(fetchIndex, 5000);
+    const maxStart = Math.max(0, slotCount - visibleSlotCount);
+    setVisibleStartSlot((prev) => clamp(prev, 0, maxStart));
+  }, [slotCount, visibleSlotCount]);
+
+  useEffect(() => {
+    if (viewMode !== "guide") {
+      lastCurrentSlotRef.current = currentSlotIndex;
+      return;
+    }
+    const prevSlot = lastCurrentSlotRef.current;
+    if (currentSlotIndex !== prevSlot && selectedCol <= prevSlot) {
+      setSelectedCol(currentSlotIndex);
+    }
+    lastCurrentSlotRef.current = currentSlotIndex;
+  }, [viewMode, currentSlotIndex, selectedCol]);
+
+  useEffect(() => {
+    if (viewMode !== "guide") return;
+    if (selectedCol !== currentSlotIndex) return;
+    const maxStart = Math.max(0, slotCount - visibleSlotCount);
+    const minStart = Math.min(currentSlotIndex, maxStart);
+    setVisibleStartSlot(clamp(currentSlotIndex, minStart, maxStart));
+  }, [viewMode, currentSlotIndex, selectedCol, slotCount, visibleSlotCount]);
+
+  useEffect(() => {
+    const maxStart = Math.max(0, slotCount - visibleSlotCount);
+    const minStart = Math.min(currentSlotIndex, maxStart);
+    if (selectedCol < visibleStartSlot) {
+      setVisibleStartSlot(clamp(selectedCol, minStart, maxStart));
+    } else if (selectedCol >= visibleStartSlot + visibleSlotCount) {
+      setVisibleStartSlot(
+        clamp(selectedCol - visibleSlotCount + 1, minStart, maxStart)
+      );
+    }
+  }, [selectedCol, visibleStartSlot, visibleSlotCount, slotCount, currentSlotIndex]);
+
+  useEffect(() => {
+    void fetchIndex();
+    const interval = window.setInterval(() => {
+      void fetchIndex();
+    }, 5000);
     return () => {
-      cancelled = true;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [fetchIndex]);
 
   useEffect(() => {
     const updateRows = () => {
@@ -994,16 +1523,27 @@ function App() {
       return;
     }
     const maxScroll = (channels.length - visibleRows) * (ROW_HEIGHT + ROW_GAP);
+    autoHoldUntilRef.current = 0;
 
     const tick = (time: number) => {
       if (lastFrameRef.current === null) lastFrameRef.current = time;
       const delta = time - lastFrameRef.current;
       lastFrameRef.current = time;
 
-      if (Date.now() >= pauseUntilRef.current) {
+      const nowMs = Date.now();
+      if (nowMs >= pauseUntilRef.current) {
         setScrollOffset((prev) => {
+          if (autoHoldUntilRef.current > nowMs) {
+            return prev;
+          }
+          if (prev >= maxScroll) {
+            return 0;
+          }
           const next = prev + (AUTO_SCROLL_PX_PER_SEC * delta) / 1000;
-          if (next >= maxScroll) return 0;
+          if (next >= maxScroll) {
+            autoHoldUntilRef.current = nowMs + AUTO_SCROLL_END_HOLD_MS;
+            return maxScroll;
+          }
           return next;
         });
       }
@@ -1076,16 +1616,16 @@ function App() {
       const code = event.code;
       const channelUp =
         key === "PageUp" ||
-        key === "]" ||
-        key === "}" ||
-        key === "ChannelUp" ||
-        code === "BracketRight";
-      const channelDown =
-        key === "PageDown" ||
         key === "[" ||
         key === "{" ||
-        key === "ChannelDown" ||
+        key === "ChannelUp" ||
         code === "BracketLeft";
+      const channelDown =
+        key === "PageDown" ||
+        key === "]" ||
+        key === "}" ||
+        key === "ChannelDown" ||
+        code === "BracketRight";
       if (key === "q" || key === "Q") {
         setShowQr((prev) => !prev);
         return;
@@ -1171,7 +1711,28 @@ function App() {
     handleChannelChange,
   ]);
 
-  const progressValue = ((now.getMinutes() % 30) / 30) * 100;
+  const progressValue = useMemo(() => {
+    if (!selectedProgram) return 0;
+    const parts = indexData.startTime.split(":");
+    const startHour = Number.parseInt(parts[0] ?? "", 10);
+    const startMinute = Number.parseInt(parts[1] ?? "", 10);
+    if (!Number.isFinite(startHour) || !Number.isFinite(startMinute)) return 0;
+    const scheduleStart = new Date(now);
+    scheduleStart.setHours(startHour, startMinute, 0, 0);
+    const programStartMs =
+      scheduleStart.getTime() +
+      selectedProgram.start * indexData.slotMinutes * 60 * 1000;
+    const durationMs =
+      Math.max(1, selectedProgram.span) * indexData.slotMinutes * 60 * 1000;
+    const elapsed = now.getTime() - programStartMs;
+    const ratio = clamp(elapsed / durationMs, 0, 1);
+    return ratio * 100;
+  }, [now, selectedProgram, indexData.startTime, indexData.slotMinutes]);
+  const posterHasVisual = hasPreviewMedia || posterImageReady;
+
+  useEffect(() => {
+    setPosterImageReady(false);
+  }, [selectedChannel?.previewUrl]);
 
   const hostOverride = params.get("host");
   const forceHttps = params.get("https") === "1";
@@ -1273,6 +1834,12 @@ function App() {
   );
   const hasAppControls = Boolean(activeRemoteAppId);
   const showAppPanel = hasAppControls && remotePanel === "app";
+  const showGodPanel = remoteGodmodeOpen;
+  useEffect(() => {
+    if (!showGodPanel) {
+      setGodmodeQuery("");
+    }
+  }, [showGodPanel]);
   const debugPanel = showDebug ? (
     <div className="debug-panel">
       <div className="debug-title">Diagnostics</div>
@@ -1285,12 +1852,48 @@ function App() {
       ) : (
         <div>Heap: unavailable</div>
       )}
+      {mediaStats ? (
+        <>
+          <div>Streams: {mediaStats.active} active</div>
+          <div>Requests: {mediaStats.requests} total</div>
+          <div>Bytes: {formatMb(mediaStats.bytesSent)} sent</div>
+          <div>Errors: {mediaStats.errors}</div>
+          {mediaStats.lastRequestAt ? (
+            <div>
+              Last:{" "}
+              {new Date(mediaStats.lastRequestAt).toLocaleTimeString("en-US", {
+                hour: "numeric",
+                minute: "2-digit",
+                second: "2-digit",
+              })}
+            </div>
+          ) : null}
+          {mediaStats.topPaths?.length ? (
+            <div className="debug-paths">
+              {mediaStats.topPaths.slice(0, 3).map((item) => (
+                <div key={item.path}>
+                  {item.path.split("/").slice(-1)[0]} · {formatMb(item.bytes)}
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <div>Media: unavailable</div>
+      )}
     </div>
+  ) : null;
+  const dialOverlayNode = dialOverlay ? (
+    <div className="dial-overlay">CH {dialOverlay}</div>
   ) : null;
 
   if (viewMode === "remote") {
     return (
-      <div className={`remote-shell ${hasAppControls ? "app-active" : ""}`}>
+      <div
+        className={`remote-shell ${hasAppControls ? "app-active" : ""} ${
+          showGodPanel ? "godmode-active" : ""
+        }`}
+      >
         <div className="remote-body">
           <div className="remote-top">
             <div className="remote-title">Chiba Cable</div>
@@ -1299,11 +1902,77 @@ function App() {
             </div>
           </div>
 
-          <div className="remote-screen">
-            <span>Guide Remote</span>
-          </div>
-
-          {showAppPanel ? (
+          {showGodPanel ? (
+            <div className="remote-god-panel">
+              <div className="remote-god-title">God Mode</div>
+              <div className="remote-god-subtitle">
+                Pick any program
+                {filteredGodmodeItems.length
+                  ? ` · ${filteredGodmodeItems.length}`
+                  : ""}
+              </div>
+              <div className="remote-god-search">
+                <input
+                  className="remote-god-input"
+                  type="search"
+                  value={godmodeQuery}
+                  onChange={(event) => setGodmodeQuery(event.target.value)}
+                  placeholder="Filter programs"
+                  autoComplete="off"
+                  autoCapitalize="none"
+                  spellCheck={false}
+                />
+                {godmodeQuery ? (
+                  <button
+                    className="remote-god-clear"
+                    onClick={() => setGodmodeQuery("")}
+                  >
+                    Clear
+                  </button>
+                ) : null}
+              </div>
+              <div className="remote-god-list">
+                {filteredGodmodeItems.length ? (
+                  filteredGodmodeItems.map((item) => (
+                    <button
+                      key={item.id}
+                      className="remote-god-item"
+                      onClick={() => {
+                        if (!item.program.url) return;
+                        send({
+                          type: "godselect",
+                          channelId: item.channel.id,
+                          url: item.program.url,
+                        });
+                        setDialBuffer("");
+                        setRemoteGodmodeOpen(false);
+                      }}
+                    >
+                      <div className="remote-god-item-title">
+                        {item.program.title}
+                      </div>
+                      <div className="remote-god-item-meta">
+                        {item.channel.number} · {item.channel.name}
+                        {item.program.subtitle
+                          ? ` · ${item.program.subtitle}`
+                          : ""}
+                      </div>
+                    </button>
+                  ))
+                ) : (
+                  <div className="remote-god-empty">
+                    {godmodeQuery ? "No matches found." : "No media found."}
+                  </div>
+                )}
+              </div>
+              <button
+                className="remote-god-close"
+                onClick={() => setRemoteGodmodeOpen(false)}
+              >
+                Close
+              </button>
+            </div>
+          ) : showAppPanel ? (
             <div className="remote-app">
               <div className="remote-app-title">
                 <span>App Controls</span>
@@ -1483,7 +2152,7 @@ function App() {
               <div className="remote-actions">
                 <button onClick={() => send({ type: "guide" })}>Guide</button>
                 <button onClick={() => send({ type: "info" })}>Info</button>
-                <button>Back</button>
+                <button onClick={() => setDialBuffer("")}>Back</button>
               </div>
 
               <button
@@ -1498,11 +2167,19 @@ function App() {
 
               <div className="remote-numpad">
                 {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
-                  <button key={num} disabled>
+                  <button
+                    key={num}
+                    disabled={showAppPanel}
+                    onClick={() => pushDialDigit(num)}
+                  >
                     {num}
                   </button>
                 ))}
-                <button className="zero" disabled>
+                <button
+                  className="zero"
+                  disabled={showAppPanel}
+                  onClick={() => pushDialDigit(0)}
+                >
                   0
                 </button>
               </div>
@@ -1510,6 +2187,7 @@ function App() {
           )}
         </div>
         {debugPanel}
+        {dialOverlayNode}
       </div>
     );
   }
@@ -1538,6 +2216,7 @@ function App() {
           </div>
         </div>
         {debugPanel}
+        {dialOverlayNode}
       </div>
     );
   }
@@ -1557,15 +2236,25 @@ function App() {
               ref={previewContainerRef}
               aria-hidden="true"
             />
-            {selectedChannel?.previewUrl && !hasPreviewIframe ? (
+            {selectedChannel?.previewUrl && !hasPreviewMedia ? (
               <img
                 className="poster-image"
                 src={selectedChannel.previewUrl}
                 alt=""
+                onLoad={() => setPosterImageReady(true)}
+                onError={() => setPosterImageReady(false)}
               />
             ) : null}
+            {playerOpen && !playerReady ? (
+              <div className="poster-loading is-active" aria-hidden="true">
+                <div className="poster-loading-ring" />
+                <div className="poster-loading-text">Tuning</div>
+              </div>
+            ) : null}
             <div className="poster-glow" />
-            <div className="poster-label">{selectedChannel?.callSign}</div>
+            {!posterHasVisual ? (
+              <div className="poster-label">{selectedChannel?.callSign}</div>
+            ) : null}
           </div>
           <div className="header-content">
             <span className="header-eyebrow">Guide</span>
@@ -1602,11 +2291,6 @@ function App() {
               })}
             </span>
           </div>
-          <div className="header-badges">
-            <span className="badge live">LIVE</span>
-            <span className="badge">HD</span>
-            <span className="badge">Stereo</span>
-          </div>
         </div>
       </header>
 
@@ -1622,16 +2306,24 @@ function App() {
             <div className="time-label-text">Network</div>
           </div>
           <div className="time-slots">
-            {indexData.timeSlots.map((slot, index) => (
-              <div
-                key={slot}
-                className={`time-slot ${
-                  index === selectedCol ? "is-active" : ""
-                }`}
-              >
-                {slot}
-              </div>
-            ))}
+            {indexData.timeSlots
+              .slice(
+                visibleStartSlot,
+                visibleStartSlot + Math.min(slotCount, visibleSlotCount)
+              )
+              .map((slot, index) => {
+                const slotIndex = visibleStartSlot + index;
+                return (
+                  <div
+                    key={slotIndex}
+                    className={`time-slot ${
+                      slotIndex === selectedCol ? "is-active" : ""
+                    }`}
+                  >
+                    {slot}
+                  </div>
+                );
+              })}
           </div>
         </div>
 
@@ -1656,44 +2348,68 @@ function App() {
                   <div className="channel-call">{channel.callSign}</div>
                 </div>
                 <div className="program-grid">
-                  {channel.schedule.map((program, index) => {
-                    const isActive =
-                      rowIndex === activeRow &&
-                      selectedCol >= program.start &&
-                      selectedCol <= program.end;
-                    const isCurrentSlot =
-                      currentSlotIndex >= program.start &&
-                      currentSlotIndex <= program.end;
-                    return (
-                      <div
-                        key={`${channel.id}-${index}`}
-                        className={`program-card ${
-                          isActive ? "is-active" : ""
-                        }`}
-                        style={{
-                          gridColumn: `span ${program.span}`,
-                          borderColor: channel.accent,
-                        }}
+                  {channel.schedule
+                    .filter(
+                      (program) =>
+                        program.end >= visibleStartSlot &&
+                        program.start < visibleStartSlot + visibleSlotCount
+                    )
+                    .map((program, index) => {
+                      const clippedStart = Math.max(
+                        program.start,
+                        visibleStartSlot
+                      );
+                      const clippedEnd = Math.min(
+                        program.end,
+                        visibleStartSlot + visibleSlotCount - 1
+                      );
+                      const span = Math.max(1, clippedEnd - clippedStart + 1);
+                      const gridColumnStart =
+                        clippedStart - visibleStartSlot + 1;
+                      const isActive =
+                        rowIndex === activeRow &&
+                        selectedCol >= program.start &&
+                        selectedCol <= program.end;
+                      const isCurrentSlot =
+                        currentSlotIndex >= program.start &&
+                        currentSlotIndex <= program.end;
+                      return (
+                        <div
+                          key={`${channel.id}-${index}`}
+                          className={`program-card ${
+                            isActive ? "is-active" : ""
+                          }`}
+                          style={{
+                            gridColumn: `${gridColumnStart} / span ${span}`,
+                            borderColor: channel.accent,
+                          }}
                         onClick={() => {
                           setSelectedRow(rowIndex);
-                          setSelectedCol(program.start);
+                          setSelectedCol(Math.max(clippedStart, currentSlotIndex));
                         }}
-                        onDoubleClick={() => {
-                          if (program.url && isCurrentSlot) {
-                            openProgram(program, channel);
-                          }
-                        }}
-                      >
-                        <div className="program-tag">
-                          {program.tag ?? "SHOW"}
+                          onDoubleClick={() => {
+                            if (
+                              channel.id === DEBUG_CHANNEL_ID ||
+                              channel.number === DEBUG_CHANNEL_NUMBER
+                            ) {
+                              setShowDebug((prev) => !prev);
+                              return;
+                            }
+                            if (program.url && isCurrentSlot) {
+                              openProgram(program, channel);
+                            }
+                          }}
+                        >
+                          <div className="program-tag">
+                            {program.tag ?? "SHOW"}
+                          </div>
+                          <div className="program-title">{program.title}</div>
+                          <div className="program-subtitle">
+                            {program.subtitle}
+                          </div>
                         </div>
-                        <div className="program-title">{program.title}</div>
-                        <div className="program-subtitle">
-                          {program.subtitle}
-                        </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
                 </div>
               </div>
             ))}
@@ -1706,9 +2422,6 @@ function App() {
           <span>
             Auto scroll active - now browsing channel {selectedChannel?.number}
           </span>
-          <span>
-            Press arrows to move. Phone remote can emulate arrows later.
-          </span>
         </div>
       </footer>
 
@@ -1716,13 +2429,6 @@ function App() {
         <div className="qr-card">
           <div className="qr-label">Scan for Remote</div>
           <img className="qr-image" src={qrUrl} alt="Remote QR code" />
-          <div className="qr-url">{remoteUrl.replace(/^https?:\/\//, "")}</div>
-          <div className="qr-hint">
-            {window.location.hostname === "localhost" ||
-            window.location.hostname === "127.0.0.1"
-              ? "Tip: open with ?host=LAN_IP"
-              : "Press Q to hide"}
-          </div>
         </div>
       ) : null}
 
@@ -1771,7 +2477,10 @@ function App() {
               />
             )}
             <div className={`player-loading ${playerReady ? "is-hidden" : ""}`}>
-              Tuning…
+              <div className="player-loading-content">
+                <span className="player-loading-label">Tuning…</span>
+                <span className="player-loading-sub">Signal lock</span>
+              </div>
             </div>
             {showPlayerHud ? (
               <div className="player-hud">
@@ -1791,6 +2500,7 @@ function App() {
         </div>
       ) : null}
       {debugPanel}
+      {dialOverlayNode}
     </div>
   );
 }

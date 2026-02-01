@@ -9,6 +9,9 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:8787',
       },
+      '/media': {
+        target: 'http://localhost:8787',
+      },
       '/village': {
         target: 'http://localhost:8787',
       },
