@@ -23,6 +23,42 @@ const sourcesFile = path.resolve(__dirname, '../data/sources.json');
 let guideIndex: GuideIndex | null = null;
 let rebuildTimer: NodeJS.Timeout | null = null;
 const villageCapture = createVillageCapture();
+type RemoteControl =
+  | {
+      id: string;
+      label: string;
+      type: 'range';
+      min: number;
+      max: number;
+      step?: number;
+      value?: number;
+    }
+  | {
+      id: string;
+      label: string;
+      type: 'select';
+      options: { value: string; label: string }[];
+      value?: string;
+    }
+  | {
+      id: string;
+      label: string;
+      type: 'toggle';
+      value?: boolean;
+    }
+  | {
+      id: string;
+      label: string;
+      type: 'button';
+    };
+
+type ControlSchema = {
+  appId: string;
+  controls: RemoteControl[];
+  updatedAt: number;
+};
+
+const controlSchemas = new Map<string, ControlSchema>();
 
 async function rebuildIndex() {
   try {
@@ -54,6 +90,16 @@ app.get('/api/index', (_req, res) => {
     return;
   }
   res.json(guideIndex);
+});
+
+app.get('/api/controls/:appId', (req, res) => {
+  const appId = req.params.appId;
+  const schema = controlSchemas.get(appId);
+  if (!schema) {
+    res.status(404).json({ error: 'controls_not_found' });
+    return;
+  }
+  res.json(schema);
 });
 
 app.get('/village.jpg', (_req, res) => {
@@ -171,6 +217,18 @@ app.get('*', (req, res) => {
 wss.on('connection', (socket) => {
   socket.on('message', (data) => {
     const message = data.toString();
+    try {
+      const parsed = JSON.parse(message) as { type?: string; appId?: string; controls?: RemoteControl[] };
+      if (parsed?.type === 'controls' && parsed.appId && Array.isArray(parsed.controls)) {
+        controlSchemas.set(parsed.appId, {
+          appId: parsed.appId,
+          controls: parsed.controls,
+          updatedAt: Date.now(),
+        });
+      }
+    } catch {
+      // ignore parse errors
+    }
     wss.clients.forEach((client) => {
       if (client.readyState === client.OPEN) {
         client.send(message);

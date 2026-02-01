@@ -66,6 +66,35 @@
       ]
     },
     {
+      "id": "code-lab",
+      "number": "133",
+      "name": "Code Lab",
+      "callSign": "DEV",
+      "description": "Programming block and experiments.",
+      "accent": "#b6ff8f",
+      "programs": [
+        {
+          "title": "Nebula Relay",
+          "subtitle": "Generative Visualizer",
+          "tag": "LAB",
+          "url": "http://localhost:8790/?ws=ws://localhost:8787/ws&appId=gen-art",
+          "durationSlots": 2
+        },
+        {
+          "title": "Compile Time",
+          "subtitle": "Build & Ship",
+          "tag": "DEV",
+          "durationSlots": 2
+        },
+        {
+          "title": "Night Shift",
+          "subtitle": "Debug Hour",
+          "tag": "DEV",
+          "durationSlots": 2
+        }
+      ]
+    },
+    {
       "id": "city-news",
       "number": "101",
       "name": "City News",

@@ -87,6 +87,23 @@
   overflow: hidden;
 }
 
+.poster-preview {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.poster-preview-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  pointer-events: none;
+}
+
 .poster-image {
   position: absolute;
   inset: 0;
@@ -588,6 +605,32 @@
   color: rgba(230, 240, 255, 0.6);
 }
 
+.debug-panel {
+  position: fixed;
+  left: 14px;
+  bottom: 14px;
+  z-index: 40;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(126, 215, 255, 0.25);
+  background: rgba(6, 10, 18, 0.75);
+  color: rgba(230, 240, 255, 0.8);
+  font-size: 0.7rem;
+  line-height: 1.4;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+
+.debug-title {
+  font-family: "Oxanium", sans-serif;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  font-size: 0.55rem;
+  color: rgba(210, 235, 255, 0.7);
+  margin-bottom: 4px;
+}
+
 @keyframes ticker {
   0% {
     transform: translateX(0);
@@ -659,6 +702,8 @@
   flex-direction: column;
   gap: var(--remote-body-gap);
   align-items: center;
+  max-height: 100%;
+  overflow: hidden;
 }
 
 .remote-top {
@@ -825,6 +870,142 @@
   font-size: clamp(0.6rem, 1.6vh, 0.7rem);
   letter-spacing: 0.16em;
   text-transform: uppercase;
+}
+
+.remote-shell.app-active {
+  --remote-pad: clamp(10px, 2.4vh, 18px);
+  --remote-gap: clamp(8px, 2vh, 12px);
+  --remote-body-gap: clamp(10px, 2.2vh, 14px);
+  --remote-font-s: clamp(0.6rem, 1.5vh, 0.8rem);
+  --remote-font-xs: clamp(0.52rem, 1.3vh, 0.66rem);
+}
+
+.remote-shell.app-active .remote-dpad {
+  --dpad-size: min(190px, 50vmin);
+  --dpad-inset: clamp(8px, 2.6vmin, 14px);
+  --dpad-btn: clamp(40px, 12vmin, 56px);
+  --dpad-ok: clamp(48px, 14vmin, 64px);
+}
+
+.remote-shell.app-active .remote-app {
+  padding: 8px 10px;
+  gap: 6px;
+}
+
+.remote-shell.app-active .remote-app-controls {
+  gap: 6px;
+}
+
+.remote-app-toggle {
+  width: 100%;
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid rgba(126, 215, 255, 0.3);
+  background: rgba(10, 18, 32, 0.9);
+  color: var(--text-soft);
+  font-size: 0.65rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.remote-app-toggle.is-active {
+  color: #e9f5ff;
+  border-color: rgba(126, 215, 255, 0.9);
+  box-shadow: 0 0 16px rgba(126, 215, 255, 0.55);
+}
+
+.remote-app-toggle:disabled {
+  opacity: 0.5;
+}
+
+.remote-app {
+  width: 100%;
+  border-radius: 14px;
+  border: 1px solid rgba(126, 215, 255, 0.25);
+  background: rgba(8, 16, 28, 0.9);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.remote-app-title {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.6rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: rgba(210, 230, 255, 0.8);
+}
+
+.remote-app-id {
+  font-family: "Oxanium", sans-serif;
+  color: rgba(210, 230, 255, 0.6);
+}
+
+.remote-app-status {
+  font-size: 0.65rem;
+  color: var(--text-soft);
+}
+
+.remote-app-back {
+  width: 100%;
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(126, 215, 255, 0.3);
+  background: rgba(16, 28, 48, 0.9);
+  color: #e9f5ff;
+  font-size: 0.7rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.remote-app-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.remote-control {
+  display: grid;
+  gap: 6px;
+}
+
+.remote-control-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.6rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgba(210, 230, 255, 0.7);
+}
+
+.remote-control-value {
+  color: rgba(210, 230, 255, 0.45);
+}
+
+.remote-control input[type="range"] {
+  width: 100%;
+  accent-color: rgba(126, 215, 255, 0.8);
+}
+
+.remote-control select,
+.remote-control button {
+  width: 100%;
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(126, 215, 255, 0.3);
+  background: rgba(18, 30, 54, 0.9);
+  color: #e9f5ff;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.remote-toggle button.is-on {
+  border-color: rgba(126, 215, 255, 0.85);
+  color: #dffcff;
+  box-shadow: 0 0 12px rgba(126, 215, 255, 0.45);
 }
 
 .remote-numpad {

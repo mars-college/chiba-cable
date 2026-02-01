@@ -4,9 +4,12 @@
   "version": "0.0.0",
   "description": "Monorepo for the Chiba Cable guide + control server",
   "scripts": {
-    "dev": "sh -c 'trap \"kill 0\" EXIT; pnpm -C apps/server dev & pnpm -C apps/guide dev'",
+    "dev": "concurrently -k -n server,guide,genart -c cyan,magenta,green \"pnpm -C apps/server dev\" \"pnpm -C apps/guide dev\" \"pnpm -C apps/genart dev\"",
     "dev:guide": "pnpm -C apps/guide dev",
     "build:guide": "pnpm -C apps/guide build",
     "dev:server": "pnpm -C apps/server dev"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
   }
 }

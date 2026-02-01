@@ -46,18 +46,68 @@ type PlayerMeta = {
   callSign?: string;
 };
 
+type MediaKind = "image" | "video" | "audio" | "iframe";
+
+type PreloadEntry = {
+  url: string;
+  kind: MediaKind;
+  status: "loading" | "ready" | "error";
+  element: HTMLElement;
+  lastUsed: number;
+};
+
+type RemoteControl =
+  | {
+      id: string;
+      label: string;
+      type: "range";
+      min: number;
+      max: number;
+      step?: number;
+      value?: number;
+    }
+  | {
+      id: string;
+      label: string;
+      type: "select";
+      options: { value: string; label: string }[];
+      value?: string;
+    }
+  | {
+      id: string;
+      label: string;
+      type: "toggle";
+      value?: boolean;
+    }
+  | {
+      id: string;
+      label: string;
+      type: "button";
+    };
+
 type RemoteMessage =
   | { type: "nav"; dir: "up" | "down" | "left" | "right" }
   | { type: "channel"; dir: "up" | "down" }
   | { type: "select" }
   | { type: "guide" }
-  | { type: "info" };
+  | { type: "info" }
+  | { type: "app"; appId?: string | null }
+  | { type: "controls"; appId: string; controls: RemoteControl[] }
+  | {
+      type: "control";
+      appId: string;
+      controlId: string;
+      value?: number | string | boolean;
+    };
 
 const USER_PAUSE_MS = 6500;
 const ROW_HEIGHT = 76;
 const ROW_GAP = 12;
 const AUTO_SCROLL_PX_PER_SEC = 14;
 const PRELOAD_DEBOUNCE_MS = 320;
+const PRELOAD_AFTER_PLAY_MS = 1200;
+const PRELOAD_CACHE_TTL_MS = 3 * 60 * 1000;
+const PRELOAD_CACHE_LIMIT = 4;
 
 const fallbackIndex: GuideIndex = {
   generatedAt: Date.now(),
@@ -141,7 +191,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function getMediaKind(url: string): "image" | "video" | "audio" | "iframe" {
+function getMediaKind(url: string): MediaKind {
   const cleaned = url.split("?")[0]?.split("#")[0]?.toLowerCase() ?? "";
   if (/\.(png|jpg|jpeg|gif|webp|avif)$/i.test(cleaned)) return "image";
   if (/\.(mp4|webm|ogg|m4v|mov)$/i.test(cleaned)) return "video";
@@ -178,6 +228,16 @@ function getWsUrl(): string {
   if (wsParam) return wsParam;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/ws`;
+}
+
+function getAppIdFromUrl(url: string | null): string | null {
+  if (!url) return null;
+  try {
+    const parsed = new URL(url, window.location.origin);
+    return parsed.searchParams.get("appId") ?? parsed.searchParams.get("app");
+  } catch {
+    return null;
+  }
 }
 
 function useRemoteSocket(onMessage?: (msg: RemoteMessage) => void) {
@@ -235,6 +295,7 @@ function App() {
     ? "art"
     : "guide";
   const returnRowParam = Number(params.get("r") ?? "");
+  const requestedRemoteAppId = params.get("app") ?? params.get("appId") ?? "";
 
   const [now, setNow] = useState(() => new Date());
   const [indexData, setIndexData] = useState<GuideIndex>(fallbackIndex);
@@ -263,37 +324,53 @@ function App() {
   const [playerReady, setPlayerReady] = useState(false);
   const [playerMeta, setPlayerMeta] = useState<PlayerMeta | null>(null);
   const [preloadUrl, setPreloadUrl] = useState<string | null>(null);
-  const [showPlayerHud, setShowPlayerHud] = useState(true);
+  const [showPlayerHud, setShowPlayerHud] = useState(false);
+  const [playerChannelIndex, setPlayerChannelIndex] = useState<number | null>(
+    null
+  );
+  const [preloadTick, setPreloadTick] = useState(0);
+  const [hasPreviewIframe, setHasPreviewIframe] = useState(false);
+  const [showDebug, setShowDebug] = useState(false);
+  const [memoryStats, setMemoryStats] = useState<{
+    used: number;
+    total: number;
+    limit: number;
+  } | null>(null);
+  const [remoteControls, setRemoteControls] = useState<RemoteControl[]>([]);
+  const [remoteControlsStatus, setRemoteControlsStatus] = useState<
+    "idle" | "loading" | "ready" | "missing"
+  >("idle");
+  const [activeRemoteAppId, setActiveRemoteAppId] =
+    useState(requestedRemoteAppId);
+  const [remotePanel, setRemotePanel] =
+    useState<"remote" | "app">("remote");
 
   const pauseUntilRef = useRef(0);
   const lastFrameRef = useRef<number | null>(null);
-  const autoRowRef = useRef(0);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const preloadTimerRef = useRef<number | null>(null);
   const prevViewModeRef = useRef(viewMode);
   const prevPlayerOpenRef = useRef(playerOpen);
+  const prevPausedRef = useRef(false);
+  const lastAppMessageRef = useRef<string | null>(null);
+  const preloadCacheRef = useRef<Map<string, PreloadEntry>>(new Map());
+  const preloadContainerRef = useRef<HTMLDivElement | null>(null);
+  const previewContainerRef = useRef<HTMLDivElement | null>(null);
+  const previewAttachedRef = useRef<HTMLIFrameElement | null>(null);
 
   const moveSelection = useCallback(
     (dir: "up" | "down" | "left" | "right") => {
-      const wasPaused = Date.now() < pauseUntilRef.current;
       pauseUntilRef.current = Date.now() + USER_PAUSE_MS;
       if (dir === "up") {
-        setSelectedRow((prev) => {
-          const base = wasPaused ? prev : autoRowRef.current;
-          return (base - 1 + channels.length) % channels.length;
-        });
+        setSelectedRow(
+          (prev) => (prev - 1 + channels.length) % channels.length
+        );
       }
       if (dir === "down") {
-        setSelectedRow((prev) => {
-          const base = wasPaused ? prev : autoRowRef.current;
-          return (base + 1) % channels.length;
-        });
+        setSelectedRow((prev) => (prev + 1) % channels.length);
       }
       if (dir === "left") {
-        const baseRow = wasPaused ? selectedRow : autoRowRef.current;
-        if (!wasPaused) {
-          setSelectedRow(baseRow);
-        }
+        const baseRow = selectedRow;
         const schedule = channels[baseRow]?.schedule ?? [];
         setSelectedCol((prev) => {
           if (!schedule.length) return prev;
@@ -306,10 +383,7 @@ function App() {
         });
       }
       if (dir === "right") {
-        const baseRow = wasPaused ? selectedRow : autoRowRef.current;
-        if (!wasPaused) {
-          setSelectedRow(baseRow);
-        }
+        const baseRow = selectedRow;
         const schedule = channels[baseRow]?.schedule ?? [];
         setSelectedCol((prev) => {
           if (!schedule.length) return prev;
@@ -325,25 +399,169 @@ function App() {
     [channels, selectedRow]
   );
 
-  const rowStride = ROW_HEIGHT + ROW_GAP;
-  const anchorRow = Math.floor(visibleRows / 2);
-  const autoRow = clamp(
-    Math.floor(scrollOffset / rowStride) + anchorRow,
-    0,
-    Math.max(0, channels.length - 1)
-  );
   const isPaused = Date.now() < pauseUntilRef.current;
-  const activeRow = isPaused ? selectedRow : autoRow;
-  autoRowRef.current = activeRow;
+  const activeRow = selectedRow;
 
   const selectedChannel = channels[activeRow];
   const selectedProgram =
     selectedChannel?.schedule.find(
       (slot) => selectedCol >= slot.start && selectedCol <= slot.end
     ) ?? selectedChannel?.schedule[0];
+  const activeAppId = useMemo(() => getAppIdFromUrl(playerUrl), [playerUrl]);
   const playerKind = useMemo(
     () => (playerUrl ? getMediaKind(playerUrl) : null),
     [playerUrl]
+  );
+
+  const formatMb = useCallback((bytes: number) => {
+    if (!Number.isFinite(bytes)) return "n/a";
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }, []);
+
+  const ensurePreloadContainer = useCallback(() => {
+    if (preloadContainerRef.current) return preloadContainerRef.current;
+    const container = document.createElement("div");
+    container.style.position = "absolute";
+    container.style.left = "-9999px";
+    container.style.top = "0";
+    container.style.width = "1px";
+    container.style.height = "1px";
+    container.style.overflow = "hidden";
+    container.style.pointerEvents = "none";
+    container.style.opacity = "0";
+    document.body.appendChild(container);
+    preloadContainerRef.current = container;
+    return container;
+  }, []);
+
+  const prunePreloadCache = useCallback(() => {
+    const nowTs = Date.now();
+    const cache = preloadCacheRef.current;
+    for (const [key, entry] of cache.entries()) {
+      if (nowTs - entry.lastUsed > PRELOAD_CACHE_TTL_MS) {
+        entry.element.remove();
+        cache.delete(key);
+      }
+    }
+    if (cache.size <= PRELOAD_CACHE_LIMIT) return;
+    const entries = Array.from(cache.values()).sort(
+      (a, b) => a.lastUsed - b.lastUsed
+    );
+    const overflow = cache.size - PRELOAD_CACHE_LIMIT;
+    for (let i = 0; i < overflow; i += 1) {
+      const entry = entries[i];
+      entry?.element.remove();
+      if (entry) {
+        cache.delete(entry.url);
+      }
+    }
+  }, []);
+
+  const queuePreload = useCallback(
+    (url: string) => {
+      if (!url) return;
+      const cache = preloadCacheRef.current;
+      const existing = cache.get(url);
+      const nowTs = Date.now();
+      if (existing) {
+        existing.lastUsed = nowTs;
+        return;
+      }
+      const kind = getMediaKind(url);
+      const container = ensurePreloadContainer();
+      let element: HTMLElement;
+      if (kind === "image") {
+        const img = document.createElement("img");
+        img.src = url;
+        element = img;
+      } else if (kind === "video") {
+        const video = document.createElement("video");
+        video.src = url;
+        video.muted = true;
+        video.preload = "auto";
+        video.playsInline = true;
+        element = video;
+      } else if (kind === "audio") {
+        const audio = document.createElement("audio");
+        audio.src = url;
+        audio.muted = true;
+        audio.preload = "auto";
+        element = audio;
+      } else {
+        const frame = document.createElement("iframe");
+        frame.src = url;
+        frame.setAttribute(
+          "sandbox",
+          "allow-scripts allow-same-origin allow-pointer-lock"
+        );
+        frame.setAttribute("allow", "autoplay; fullscreen");
+        frame.setAttribute("loading", "eager");
+        element = frame;
+      }
+      element.style.position = "absolute";
+      element.style.left = "-9999px";
+      element.style.top = "0";
+      element.style.width = "1px";
+      element.style.height = "1px";
+      element.style.opacity = "0";
+      element.style.pointerEvents = "none";
+      element.setAttribute("aria-hidden", "true");
+      container.appendChild(element);
+
+      const entry: PreloadEntry = {
+        url,
+        kind,
+        status: "loading",
+        element,
+        lastUsed: nowTs,
+      };
+      cache.set(url, entry);
+
+      if (kind === "image") {
+        (element as HTMLImageElement).onload = () => {
+          entry.status = "ready";
+          entry.lastUsed = Date.now();
+          setPreloadTick((prev) => prev + 1);
+        };
+        (element as HTMLImageElement).onerror = () => {
+          entry.status = "error";
+          setPreloadTick((prev) => prev + 1);
+        };
+      } else if (kind === "video") {
+        (element as HTMLVideoElement).onloadeddata = () => {
+          entry.status = "ready";
+          entry.lastUsed = Date.now();
+          setPreloadTick((prev) => prev + 1);
+        };
+        (element as HTMLVideoElement).onerror = () => {
+          entry.status = "error";
+          setPreloadTick((prev) => prev + 1);
+        };
+      } else if (kind === "audio") {
+        (element as HTMLAudioElement).oncanplaythrough = () => {
+          entry.status = "ready";
+          entry.lastUsed = Date.now();
+          setPreloadTick((prev) => prev + 1);
+        };
+        (element as HTMLAudioElement).onerror = () => {
+          entry.status = "error";
+          setPreloadTick((prev) => prev + 1);
+        };
+      } else {
+        (element as HTMLIFrameElement).onload = () => {
+          entry.status = "ready";
+          entry.lastUsed = Date.now();
+          setPreloadTick((prev) => prev + 1);
+        };
+        (element as HTMLIFrameElement).onerror = () => {
+          entry.status = "error";
+          setPreloadTick((prev) => prev + 1);
+        };
+      }
+
+      prunePreloadCache();
+    },
+    [ensurePreloadContainer, prunePreloadCache]
   );
 
   const openProgram = useCallback(
@@ -355,6 +573,8 @@ function App() {
         setPlayerUrl(program.url);
       }
       setShowPlayerHud(true);
+      const channelIndex = channels.findIndex((item) => item.id === channel.id);
+      setPlayerChannelIndex(channelIndex >= 0 ? channelIndex : activeRow);
       setPlayerMeta({
         title: program.title,
         subtitle: program.subtitle,
@@ -362,7 +582,7 @@ function App() {
         callSign: channel.callSign,
       });
     },
-    [playerUrl]
+    [playerUrl, channels, activeRow]
   );
 
   const handleChannelChange = useCallback(
@@ -408,61 +628,90 @@ function App() {
     openProgram,
   ]);
 
-  const { send, status } = useRemoteSocket(
-    viewMode === "remote"
-      ? undefined
-      : (msg) => {
-          if (msg.type === "guide") {
-            if (playerOpen) {
-              setPlayerOpen(false);
-              return;
-            }
-            if (viewMode !== "guide") {
-              const returnRow = Number.isFinite(returnRowParam)
-                ? Math.floor(returnRowParam)
-                : null;
-              const target = returnRow === null ? "/" : `/?r=${returnRow}`;
-              window.location.assign(target);
-            }
-            return;
-          }
-          if (msg.type === "info") {
-            if (playerOpen) {
-              setShowPlayerHud((prev) => !prev);
-            }
-            return;
-          }
-          if (msg.type === "channel") {
-            if (viewMode === "guide") {
-              handleChannelChange(msg.dir);
-            }
-            return;
-          }
-          if (msg.type === "nav") {
-            if (viewMode === "art") {
-              const artItems =
-                channels
-                  .find((channel) => channel.id === (channelId ?? "jensen-art"))
-                  ?.schedule.filter((slot) => slot.url) ?? [];
-              if (msg.dir === "left" || msg.dir === "up") {
-                setArtIndex(
-                  (prev) => (prev - 1 + artItems.length) % artItems.length
-                );
-              } else if (msg.dir === "right" || msg.dir === "down") {
-                setArtIndex((prev) => (prev + 1) % artItems.length);
-              }
-              return;
-            }
-            moveSelection(msg.dir);
-          }
-          if (msg.type === "select") {
-            if (viewMode === "art") {
-              setArtPaused((prev) => !prev);
-            } else {
-              handleSelect();
-            }
-          }
+  const { send, status } = useRemoteSocket((msg) => {
+    if (viewMode === "remote") {
+      if (msg.type === "app") {
+        const nextAppId = msg.appId ?? "";
+        if (requestedRemoteAppId) return;
+        setActiveRemoteAppId(nextAppId);
+      }
+      return;
+    }
+
+    if (msg.type === "guide") {
+      if (playerOpen) {
+        setPlayerOpen(false);
+        return;
+      }
+      if (viewMode !== "guide") {
+        const returnRow = Number.isFinite(returnRowParam)
+          ? Math.floor(returnRowParam)
+          : null;
+        const target = returnRow === null ? "/" : `/?r=${returnRow}`;
+        window.location.assign(target);
+      }
+      return;
+    }
+    if (msg.type === "info") {
+      if (playerOpen) {
+        setShowPlayerHud((prev) => !prev);
+      }
+      return;
+    }
+    if (msg.type === "channel") {
+      if (viewMode === "guide") {
+        handleChannelChange(msg.dir);
+      }
+      return;
+    }
+    if (msg.type === "nav") {
+      if (viewMode === "art") {
+        const artItems =
+          channels
+            .find((channel) => channel.id === (channelId ?? "jensen-art"))
+            ?.schedule.filter((slot) => slot.url) ?? [];
+        if (msg.dir === "left" || msg.dir === "up") {
+          setArtIndex((prev) => (prev - 1 + artItems.length) % artItems.length);
+        } else if (msg.dir === "right" || msg.dir === "down") {
+          setArtIndex((prev) => (prev + 1) % artItems.length);
         }
+        return;
+      }
+      moveSelection(msg.dir);
+    }
+    if (msg.type === "select") {
+      if (viewMode === "art") {
+        setArtPaused((prev) => !prev);
+      } else {
+        handleSelect();
+      }
+    }
+  });
+
+  const mergeRemoteControls = useCallback(
+    (incoming: RemoteControl[], current: RemoteControl[]) =>
+      incoming.map((control) => {
+        const prev = current.find((item) => item.id === control.id);
+        if (!prev) return control;
+        if ("value" in prev && prev.value !== undefined) {
+          return { ...control, value: prev.value } as RemoteControl;
+        }
+        return control;
+      }),
+    []
+  );
+
+  const handleRemoteControl = useCallback(
+    (controlId: string, value: number | string | boolean) => {
+      if (!activeRemoteAppId) return;
+      setRemoteControls((prev) =>
+        prev.map((control) =>
+          control.id === controlId ? { ...control, value } : control
+        )
+      );
+      send({ type: "control", appId: activeRemoteAppId, controlId, value });
+    },
+    [activeRemoteAppId, send]
   );
 
   const gridStyle = useMemo(
@@ -496,6 +745,170 @@ function App() {
   }, [playerOpen]);
 
   useEffect(() => {
+    if (!showDebug) return;
+    const update = () => {
+      const memory = (performance as Performance & { memory?: any }).memory;
+      if (!memory) {
+        setMemoryStats(null);
+        return;
+      }
+      setMemoryStats({
+        used: memory.usedJSHeapSize,
+        total: memory.totalJSHeapSize,
+        limit: memory.jsHeapSizeLimit,
+      });
+    };
+    update();
+    const interval = window.setInterval(update, 1000);
+    return () => window.clearInterval(interval);
+  }, [showDebug]);
+
+  useEffect(() => {
+    if (!prevPausedRef.current && isPaused) {
+      const maxScroll = Math.max(
+        0,
+        (channels.length - visibleRows) * (ROW_HEIGHT + ROW_GAP)
+      );
+      const anchor = Math.floor(visibleRows / 2);
+      const desired = clamp(
+        selectedRow - anchor,
+        0,
+        Math.max(0, channels.length - visibleRows)
+      );
+      setScrollOffset(clamp(desired * (ROW_HEIGHT + ROW_GAP), 0, maxScroll));
+      lastFrameRef.current = null;
+      prevPausedRef.current = true;
+      return;
+    }
+    if (prevPausedRef.current && !isPaused) {
+      const maxScroll = Math.max(
+        0,
+        (channels.length - visibleRows) * (ROW_HEIGHT + ROW_GAP)
+      );
+      const anchor = Math.floor(visibleRows / 2);
+      const desired = clamp(
+        selectedRow - anchor,
+        0,
+        Math.max(0, channels.length - visibleRows)
+      );
+      setScrollOffset(clamp(desired * (ROW_HEIGHT + ROW_GAP), 0, maxScroll));
+      lastFrameRef.current = null;
+      prevPausedRef.current = false;
+      return;
+    }
+    prevPausedRef.current = isPaused;
+  }, [isPaused, channels.length, selectedRow, visibleRows]);
+
+  useEffect(() => {
+    return () => {
+      preloadCacheRef.current.forEach((entry) => entry.element.remove());
+      preloadCacheRef.current.clear();
+      preloadContainerRef.current?.remove();
+      preloadContainerRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (viewMode !== "guide") return;
+    const container = previewContainerRef.current;
+    if (!container) return;
+    const cacheContainer = ensurePreloadContainer();
+    const currentUrl = selectedProgram?.url ?? null;
+    const cacheEntry = currentUrl
+      ? preloadCacheRef.current.get(currentUrl)
+      : null;
+    const readyFrame =
+      cacheEntry?.kind === "iframe" && cacheEntry.status === "ready"
+        ? (cacheEntry.element as HTMLIFrameElement)
+        : null;
+
+    const setHiddenStyles = (frame: HTMLIFrameElement) => {
+      frame.style.position = "absolute";
+      frame.style.left = "-9999px";
+      frame.style.top = "0";
+      frame.style.width = "1px";
+      frame.style.height = "1px";
+      frame.style.opacity = "0";
+      frame.style.pointerEvents = "none";
+    };
+
+    const setPreviewStyles = (frame: HTMLIFrameElement) => {
+      frame.style.position = "absolute";
+      frame.style.left = "0";
+      frame.style.top = "0";
+      frame.style.width = "100%";
+      frame.style.height = "100%";
+      frame.style.opacity = "1";
+      frame.style.pointerEvents = "auto";
+    };
+
+    if (readyFrame) {
+      if (
+        previewAttachedRef.current &&
+        previewAttachedRef.current !== readyFrame
+      ) {
+        setHiddenStyles(previewAttachedRef.current);
+        cacheContainer.appendChild(previewAttachedRef.current);
+      }
+      if (readyFrame.parentElement !== container) {
+        readyFrame.classList.add("poster-preview-frame");
+        setPreviewStyles(readyFrame);
+        container.appendChild(readyFrame);
+      }
+      previewAttachedRef.current = readyFrame;
+      setHasPreviewIframe(true);
+      return;
+    }
+
+    if (previewAttachedRef.current) {
+      setHiddenStyles(previewAttachedRef.current);
+      cacheContainer.appendChild(previewAttachedRef.current);
+      previewAttachedRef.current = null;
+    }
+    setHasPreviewIframe(false);
+  }, [viewMode, selectedProgram?.url, preloadTick, ensurePreloadContainer]);
+
+  useEffect(() => {
+    if (!playerOpen || !playerUrl) return;
+    if (!channels.length) return;
+    const baseIndex =
+      playerChannelIndex ??
+      clamp(activeRow, 0, Math.max(0, channels.length - 1));
+    if (!Number.isFinite(baseIndex)) return;
+    const neighborRows = [
+      (baseIndex - 1 + channels.length) % channels.length,
+      (baseIndex + 1) % channels.length,
+    ];
+    const neighborUrls = neighborRows
+      .map((row) => {
+        const channel = channels[row];
+        const program =
+          channel?.schedule.find(
+            (slot) =>
+              currentSlotIndex >= slot.start && currentSlotIndex <= slot.end
+          ) ?? channel?.schedule[0];
+        return program?.url ?? null;
+      })
+      .filter(
+        (url, index, all): url is string =>
+          Boolean(url) && url !== playerUrl && all.indexOf(url) === index
+      );
+    if (!neighborUrls.length) return;
+    const timer = window.setTimeout(() => {
+      neighborUrls.forEach((url) => queuePreload(url));
+    }, PRELOAD_AFTER_PLAY_MS);
+    return () => window.clearTimeout(timer);
+  }, [
+    playerOpen,
+    playerUrl,
+    channels,
+    playerChannelIndex,
+    activeRow,
+    currentSlotIndex,
+    queuePreload,
+  ]);
+
+  useEffect(() => {
     if (viewMode !== "guide") return;
     if (playerOpen) return;
     const url = selectedProgram?.url ?? null;
@@ -508,13 +921,14 @@ function App() {
     }
     preloadTimerRef.current = window.setTimeout(() => {
       setPreloadUrl(url);
+      queuePreload(url);
     }, PRELOAD_DEBOUNCE_MS);
     return () => {
       if (preloadTimerRef.current) {
         window.clearTimeout(preloadTimerRef.current);
       }
     };
-  }, [viewMode, playerOpen, selectedProgram?.url]);
+  }, [viewMode, playerOpen, selectedProgram?.url, queuePreload]);
 
   useEffect(() => {
     if (!preloadUrl || playerOpen) return;
@@ -676,6 +1090,10 @@ function App() {
         setShowQr((prev) => !prev);
         return;
       }
+      if (key === "d" || key === "D") {
+        setShowDebug((prev) => !prev);
+        return;
+      }
       if (playerOpen && (key === "i" || key === "I")) {
         setShowPlayerHud((prev) => !prev);
         return;
@@ -797,6 +1215,55 @@ function App() {
     remoteUrl
   )}`;
 
+  useEffect(() => {
+    if (viewMode !== "remote" || !activeRemoteAppId) return;
+    let cancelled = false;
+
+    const loadControls = async () => {
+      setRemoteControlsStatus((prev) => (prev === "ready" ? prev : "loading"));
+      try {
+        const res = await fetch(`/api/controls/${activeRemoteAppId}`);
+        if (!res.ok) {
+          if (!cancelled && res.status === 404) {
+            setRemoteControlsStatus("missing");
+          }
+          return;
+        }
+        const data = (await res.json()) as {
+          controls?: RemoteControl[];
+        };
+        if (cancelled) return;
+        setRemoteControls((prev) =>
+          mergeRemoteControls(data.controls ?? [], prev)
+        );
+        setRemoteControlsStatus("ready");
+      } catch {
+        if (!cancelled) setRemoteControlsStatus("missing");
+      }
+    };
+
+    loadControls();
+    const interval = window.setInterval(loadControls, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [viewMode, activeRemoteAppId, mergeRemoteControls]);
+
+  useEffect(() => {
+    if (viewMode !== "remote") return;
+    setRemoteControls([]);
+    setRemoteControlsStatus(activeRemoteAppId ? "loading" : "idle");
+  }, [viewMode, activeRemoteAppId]);
+
+  useEffect(() => {
+    if (viewMode !== "guide") return;
+    const nextAppId = playerOpen ? activeAppId : null;
+    if (lastAppMessageRef.current === nextAppId) return;
+    lastAppMessageRef.current = nextAppId;
+    send({ type: "app", appId: nextAppId });
+  }, [viewMode, playerOpen, activeAppId, send]);
+
   const rowStyle = useMemo(
     () =>
       ({
@@ -804,10 +1271,26 @@ function App() {
       } as CSSProperties),
     [scrollOffset]
   );
+  const hasAppControls = Boolean(activeRemoteAppId);
+  const showAppPanel = hasAppControls && remotePanel === "app";
+  const debugPanel = showDebug ? (
+    <div className="debug-panel">
+      <div className="debug-title">Diagnostics</div>
+      {memoryStats ? (
+        <>
+          <div>Heap: {formatMb(memoryStats.used)} used</div>
+          <div>Total: {formatMb(memoryStats.total)}</div>
+          <div>Limit: {formatMb(memoryStats.limit)}</div>
+        </>
+      ) : (
+        <div>Heap: unavailable</div>
+      )}
+    </div>
+  ) : null;
 
   if (viewMode === "remote") {
     return (
-      <div className="remote-shell">
+      <div className={`remote-shell ${hasAppControls ? "app-active" : ""}`}>
         <div className="remote-body">
           <div className="remote-top">
             <div className="remote-title">Chiba Cable</div>
@@ -820,71 +1303,213 @@ function App() {
             <span>Guide Remote</span>
           </div>
 
-          <div className="remote-controls">
-            <div className="rocker">
-              <button onClick={() => send({ type: "channel", dir: "up" })}>
-                CH UP
+          {showAppPanel ? (
+            <div className="remote-app">
+              <div className="remote-app-title">
+                <span>App Controls</span>
+              </div>
+              <button
+                className="remote-app-back"
+                onClick={() => setRemotePanel("remote")}
+              >
+                Back to Remote
               </button>
-              <span>CH</span>
-              <button onClick={() => send({ type: "channel", dir: "down" })}>
-                CH DOWN
-              </button>
+              {remoteControlsStatus === "loading" ? (
+                <div className="remote-app-status">Loading controls…</div>
+              ) : null}
+              {remoteControlsStatus === "missing" ? (
+                <div className="remote-app-status">
+                  No controls yet. Open the app once.
+                </div>
+              ) : null}
+              {remoteControls.length ? (
+                <div className="remote-app-controls">
+                  {remoteControls.map((control) => {
+                    if (control.type === "range") {
+                      const value =
+                        typeof control.value === "number"
+                          ? control.value
+                          : control.min;
+                      return (
+                        <label
+                          key={control.id}
+                          className="remote-control remote-range"
+                        >
+                          <span className="remote-control-label">
+                            {control.label}
+                            <span className="remote-control-value">
+                              {value.toFixed(2)}
+                            </span>
+                          </span>
+                          <input
+                            type="range"
+                            min={control.min}
+                            max={control.max}
+                            step={control.step ?? 0.1}
+                            value={value}
+                            onChange={(event) =>
+                              handleRemoteControl(
+                                control.id,
+                                Number(event.currentTarget.value)
+                              )
+                            }
+                          />
+                        </label>
+                      );
+                    }
+                    if (control.type === "select") {
+                      const value =
+                        control.value ?? control.options[0]?.value ?? "";
+                      return (
+                        <label
+                          key={control.id}
+                          className="remote-control remote-select"
+                        >
+                          <span className="remote-control-label">
+                            {control.label}
+                          </span>
+                          <select
+                            value={value}
+                            onChange={(event) =>
+                              handleRemoteControl(
+                                control.id,
+                                event.currentTarget.value
+                              )
+                            }
+                          >
+                            {control.options.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      );
+                    }
+                    if (control.type === "toggle") {
+                      const value = Boolean(control.value);
+                      return (
+                        <div
+                          key={control.id}
+                          className="remote-control remote-toggle"
+                        >
+                          <span className="remote-control-label">
+                            {control.label}
+                          </span>
+                          <button
+                            className={value ? "is-on" : ""}
+                            onClick={() =>
+                              handleRemoteControl(control.id, !value)
+                            }
+                          >
+                            {value ? "On" : "Off"}
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div
+                        key={control.id}
+                        className="remote-control remote-button"
+                      >
+                        <span className="remote-control-label">
+                          {control.label}
+                        </span>
+                        <button
+                          onClick={() =>
+                            handleRemoteControl(control.id, Date.now())
+                          }
+                        >
+                          Trigger
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : null}
             </div>
+          ) : (
+            <>
+              <div className="remote-controls">
+                <div className="rocker">
+                  <button onClick={() => send({ type: "channel", dir: "up" })}>
+                    CH UP
+                  </button>
+                  <span>CH</span>
+                  <button
+                    onClick={() => send({ type: "channel", dir: "down" })}
+                  >
+                    CH DOWN
+                  </button>
+                </div>
 
-            <div className="rocker">
-              <button disabled>VOL UP</button>
-              <span>VOL</span>
-              <button disabled>VOL DOWN</button>
-            </div>
-          </div>
+                <div className="rocker">
+                  <button disabled>VOL UP</button>
+                  <span>VOL</span>
+                  <button disabled>VOL DOWN</button>
+                </div>
+              </div>
 
-          <div className="remote-dpad">
-            <button
-              className="up"
-              onClick={() => send({ type: "nav", dir: "up" })}
-            >
-              UP
-            </button>
-            <button
-              className="left"
-              onClick={() => send({ type: "nav", dir: "left" })}
-            >
-              LEFT
-            </button>
-            <button className="ok" onClick={() => send({ type: "select" })}>
-              OK
-            </button>
-            <button
-              className="right"
-              onClick={() => send({ type: "nav", dir: "right" })}
-            >
-              RIGHT
-            </button>
-            <button
-              className="down"
-              onClick={() => send({ type: "nav", dir: "down" })}
-            >
-              DOWN
-            </button>
-          </div>
+              <div className="remote-dpad">
+                <button
+                  className="up"
+                  onClick={() => send({ type: "nav", dir: "up" })}
+                >
+                  UP
+                </button>
+                <button
+                  className="left"
+                  onClick={() => send({ type: "nav", dir: "left" })}
+                >
+                  LEFT
+                </button>
+                <button className="ok" onClick={() => send({ type: "select" })}>
+                  OK
+                </button>
+                <button
+                  className="right"
+                  onClick={() => send({ type: "nav", dir: "right" })}
+                >
+                  RIGHT
+                </button>
+                <button
+                  className="down"
+                  onClick={() => send({ type: "nav", dir: "down" })}
+                >
+                  DOWN
+                </button>
+              </div>
 
-          <div className="remote-actions">
-            <button onClick={() => send({ type: "guide" })}>Guide</button>
-            <button onClick={() => send({ type: "info" })}>Info</button>
-            <button>Back</button>
-          </div>
+              <div className="remote-actions">
+                <button onClick={() => send({ type: "guide" })}>Guide</button>
+                <button onClick={() => send({ type: "info" })}>Info</button>
+                <button>Back</button>
+              </div>
 
-          <div className="remote-numpad">
-            {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
-              <button key={num} disabled>
-                {num}
+              <button
+                className={`remote-app-toggle ${
+                  hasAppControls ? "is-active" : ""
+                }`}
+                disabled={!hasAppControls}
+                onClick={() => setRemotePanel("app")}
+              >
+                App Controls
               </button>
-            ))}
-            <button className="zero" disabled>
-              0
-            </button>
-          </div>
+
+              <div className="remote-numpad">
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((num) => (
+                  <button key={num} disabled>
+                    {num}
+                  </button>
+                ))}
+                <button className="zero" disabled>
+                  0
+                </button>
+              </div>
+            </>
+          )}
         </div>
+        {debugPanel}
       </div>
     );
   }
@@ -912,6 +1537,7 @@ function App() {
             {artPaused ? "Paused" : "Auto"} - arrows to navigate, space to pause
           </div>
         </div>
+        {debugPanel}
       </div>
     );
   }
@@ -926,7 +1552,12 @@ function App() {
       <header className="guide-header">
         <div className="header-card">
           <div className="poster">
-            {selectedChannel?.previewUrl ? (
+            <div
+              className="poster-preview"
+              ref={previewContainerRef}
+              aria-hidden="true"
+            />
+            {selectedChannel?.previewUrl && !hasPreviewIframe ? (
               <img
                 className="poster-image"
                 src={selectedChannel.previewUrl}
@@ -1159,6 +1790,7 @@ function App() {
           </div>
         </div>
       ) : null}
+      {debugPanel}
     </div>
   );
 }
