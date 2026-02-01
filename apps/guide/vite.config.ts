@@ -18,6 +18,12 @@ export default defineConfig({
       '/village.jpg': {
         target: 'http://localhost:8787',
       },
+      '/weatherstar': {
+        target: 'http://localhost:8787',
+      },
+      '/weatherstar.jpg': {
+        target: 'http://localhost:8787',
+      },
       '/ws': {
         target: 'ws://localhost:8787',
         ws: true,

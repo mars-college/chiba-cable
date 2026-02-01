@@ -10,6 +10,7 @@ import { buildIndexFromFile, type GuideIndex } from './index-builder.js';
 import { buildIndexFromConfig } from './index-builder-config.js';
 import { loadConfig, type LoadedConfig } from './config.js';
 import { createVillageCapture } from './village-capture.js';
+import { createWeatherstarCapture } from './weatherstar-capture.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,6 +31,7 @@ const configPath = process.env.CHIBA_CONFIG ?? path.resolve(repoRoot, 'config/ch
 let guideIndex: GuideIndex | null = null;
 let rebuildTimer: NodeJS.Timeout | null = null;
 const villageCapture = createVillageCapture();
+const weatherstarCapture = createWeatherstarCapture();
 let loadedConfig: LoadedConfig | null = null;
 let mediaRoots: string[] = [];
 let configWatchers: Array<ReturnType<typeof fs.watch>> = [];
@@ -497,6 +499,86 @@ app.get('/village', (_req, res) => {
 </html>`);
 });
 
+app.get('/weatherstar.jpg', (_req, res) => {
+  const frame = weatherstarCapture.getFrame();
+  if (!frame) {
+    res.status(503).send('capture_not_ready');
+    return;
+  }
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(frame.buffer);
+});
+
+app.get('/weatherstar', (_req, res) => {
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WeatherStar</title>
+    <style>
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: #05060a;
+      }
+      body {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+      }
+      #frame {
+        width: 100vw;
+        height: 100vh;
+        object-fit: cover;
+        object-position: center;
+        display: block;
+        background: #05060a;
+      }
+      #status {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-family: "Alegreya Sans", "Segoe UI", sans-serif;
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(230, 240, 255, 0.8);
+        background: rgba(6, 12, 24, 0.55);
+        border: 1px solid rgba(120, 200, 255, 0.35);
+      }
+    </style>
+  </head>
+  <body>
+    <img id="frame" alt="WeatherStar feed" />
+    <div id="status">Loading...</div>
+    <script>
+      const img = document.getElementById('frame');
+      const status = document.getElementById('status');
+      const refreshMs = ${weatherstarCapture.options.intervalMs};
+      const tick = () => {
+        const ts = Date.now();
+        img.src = '/weatherstar.jpg?ts=' + ts;
+      };
+      img.addEventListener('load', () => {
+        status.textContent = 'Live';
+      });
+      img.addEventListener('error', () => {
+        status.textContent = 'Connecting';
+      });
+      tick();
+      setInterval(tick, refreshMs);
+    </script>
+  </body>
+</html>`);
+});
+
 app.use(express.static(distDir, { index: false }));
 
 function getBaseUrl(req: express.Request): string {
@@ -584,6 +666,7 @@ wss.on('connection', (socket, req) => {
 server.listen(PORT, () => {
   console.log(`Guide server running on http://localhost:${PORT}`);
   void villageCapture.start();
+  void weatherstarCapture.start();
 });
 
 server.on('close', () => {

@@ -7,6 +7,7 @@ import {
   type CSSProperties,
 } from "react";
 import "./App.css";
+import { DEFAULT_THEME_ID, THEME_MAP, THEME_ORDER } from "./themes";
 
 type ProgramSlot = {
   title: string;
@@ -61,6 +62,12 @@ type MediaDebugStats = {
     bytes: number;
     lastAt: number;
   }>;
+};
+
+type DisplaySettings = {
+  scale?: number;
+  hours?: number;
+  theme?: string;
 };
 
 type MediaKind = "image" | "video" | "audio" | "iframe";
@@ -126,6 +133,13 @@ type RemoteMessage =
       appId: string;
       controlId: string;
       value?: number | string | boolean;
+    }
+  | {
+      type: "display";
+      scale?: number | null;
+      hours?: number | null;
+      theme?: string | null;
+      screenId?: string | null;
     };
 
 const USER_PAUSE_MS = 6500;
@@ -133,11 +147,17 @@ const ROW_HEIGHT = 76;
 const ROW_GAP = 12;
 const AUTO_SCROLL_PX_PER_SEC = 14;
 const AUTO_SCROLL_END_HOLD_MS = 2200;
-const VISIBLE_HOURS = 3;
+const LANDSCAPE_VISIBLE_HOURS = 3;
+const PORTRAIT_VISIBLE_HOURS = 2;
+const MIN_VISIBLE_ROWS = 2;
+const MAX_VISIBLE_ROWS = 4;
+const UI_SCALE_DEFAULT = 1.1;
+const DISPLAY_STORAGE_KEY = "chiba:display";
+const PRELOAD_MODE: "none" | "image" | "all" = "image";
 const PRELOAD_DEBOUNCE_MS = 320;
 const PRELOAD_AFTER_PLAY_MS = 1200;
-const PRELOAD_CACHE_TTL_MS = 3 * 60 * 1000;
-const PRELOAD_CACHE_LIMIT = 4;
+const PRELOAD_CACHE_TTL_MS = 60 * 1000;
+const PRELOAD_CACHE_LIMIT = 2;
 const DEBUG_CHANNEL_ID = "debug";
 const DEBUG_CHANNEL_NUMBER = "026";
 const GODMODE_CHANNEL_ID = "godmode";
@@ -296,6 +316,26 @@ function normalizeChannelNumber(value: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function loadDisplaySettings(): DisplaySettings {
+  try {
+    const raw = window.localStorage.getItem(DISPLAY_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as DisplaySettings;
+    if (!parsed || typeof parsed !== "object") return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+
+function loadScreenId(): string {
+  try {
+    return window.localStorage.getItem("chiba:screen") ?? "";
+  } catch {
+    return "";
+  }
+}
+
 function getMediaKind(url: string): MediaKind {
   const cleaned = url.split("?")[0]?.split("#")[0]?.toLowerCase() ?? "";
   if (/\.(png|jpg|jpeg|gif|webp|avif)$/i.test(cleaned)) return "image";
@@ -436,16 +476,54 @@ function App() {
     : "guide";
   const returnRowParam = Number(params.get("r") ?? "");
   const requestedRemoteAppId = params.get("app") ?? params.get("appId") ?? "";
+  const scaleParam = params.get("scale");
+  const hoursParam = params.get("hours");
+  const themeParam = params.get("theme");
+  const screenParam = params.get("screen") ?? params.get("screenId");
+  const [screenId, setScreenId] = useState(() =>
+    screenParam ? screenParam : loadScreenId()
+  );
+  const [displaySettings, setDisplaySettings] = useState<DisplaySettings>(() =>
+    loadDisplaySettings()
+  );
+  const activeThemeId = useMemo(() => {
+    const fromParam = themeParam ? themeParam.trim() : "";
+    const fromSettings = displaySettings.theme ?? "";
+    const candidate = fromParam || fromSettings || DEFAULT_THEME_ID;
+    return THEME_MAP[candidate] ? candidate : DEFAULT_THEME_ID;
+  }, [themeParam, displaySettings.theme]);
+  const themeVars = useMemo(() => THEME_MAP[activeThemeId]?.vars ?? {}, [
+    activeThemeId,
+  ]);
+  const uiScale = useMemo(() => {
+    const raw = scaleParam
+      ? Number(scaleParam)
+      : displaySettings.scale ?? UI_SCALE_DEFAULT;
+    if (!Number.isFinite(raw)) return UI_SCALE_DEFAULT;
+    return clamp(raw, 0.85, 1.6);
+  }, [scaleParam, displaySettings.scale]);
 
   const [now, setNow] = useState(() => new Date());
+  const [viewportSize, setViewportSize] = useState(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }));
   const [indexData, setIndexData] = useState<GuideIndex>(() =>
     ensureSystemChannels(fallbackIndex)
   );
   const slotCount = indexData.timeSlots.length;
+  const isPortrait = viewportSize.height >= viewportSize.width;
+  const visibleHours = useMemo(() => {
+    const raw = hoursParam
+      ? Number(hoursParam)
+      : displaySettings.hours ?? NaN;
+    if (Number.isFinite(raw) && raw > 0) return raw;
+    return isPortrait ? PORTRAIT_VISIBLE_HOURS : LANDSCAPE_VISIBLE_HOURS;
+  }, [hoursParam, displaySettings.hours, isPortrait]);
   const visibleSlotCount = useMemo(() => {
     const minutes = Math.max(1, indexData.slotMinutes);
-    return Math.max(1, Math.round((VISIBLE_HOURS * 60) / minutes));
-  }, [indexData.slotMinutes]);
+    return Math.max(1, Math.round((visibleHours * 60) / minutes));
+  }, [indexData.slotMinutes, visibleHours]);
   const allChannels = indexData.channels;
   const channels = useMemo(
     () => allChannels.filter((channel) => !isHiddenChannel(channel)),
@@ -650,6 +728,12 @@ function App() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }, []);
 
+  const shouldPreload = useCallback((kind: MediaKind) => {
+    if (PRELOAD_MODE === "all") return true;
+    if (PRELOAD_MODE === "image") return kind === "image";
+    return false;
+  }, []);
+
   const ensurePreloadContainer = useCallback(() => {
     if (preloadContainerRef.current) return preloadContainerRef.current;
     const container = document.createElement("div");
@@ -693,13 +777,14 @@ function App() {
     (url: string) => {
       if (!url) return;
       const cache = preloadCacheRef.current;
+      const kind = getMediaKind(url);
+      if (!shouldPreload(kind)) return;
       const existing = cache.get(url);
       const nowTs = Date.now();
       if (existing) {
         existing.lastUsed = nowTs;
         return;
       }
-      const kind = getMediaKind(url);
       const container = ensurePreloadContainer();
       let element: HTMLElement;
       if (kind === "image") {
@@ -793,7 +878,7 @@ function App() {
 
       prunePreloadCache();
     },
-    [ensurePreloadContainer, prunePreloadCache]
+    [ensurePreloadContainer, prunePreloadCache, shouldPreload]
   );
 
   const openProgram = useCallback(
@@ -883,6 +968,12 @@ function App() {
       if (targetNumber === normalizeChannelNumber(DEBUG_CHANNEL_NUMBER)) {
         setShowDebug(true);
         setPlayerOpen(false);
+        sendRef.current?.({
+          type: "now",
+          channelId: DEBUG_CHANNEL_ID,
+          number: DEBUG_CHANNEL_NUMBER,
+          title: "Diagnostics",
+        });
         return;
       }
       const targetChannel = allChannels.find((channel) => {
@@ -970,7 +1061,42 @@ function App() {
     }
   }, []);
 
+  const applyDisplaySettings = useCallback(
+    (payload: {
+      scale?: number | null;
+      hours?: number | null;
+      theme?: string | null;
+    }) => {
+      setDisplaySettings((prev) => {
+        const next: DisplaySettings = { ...prev };
+        if (payload.scale === null) {
+          delete next.scale;
+        } else if (typeof payload.scale === "number") {
+          next.scale = clamp(payload.scale, 0.85, 1.6);
+        }
+        if (payload.hours === null) {
+          delete next.hours;
+        } else if (typeof payload.hours === "number") {
+          next.hours = clamp(payload.hours, 1, 6);
+        }
+        if (payload.theme === null) {
+          delete next.theme;
+        } else if (typeof payload.theme === "string") {
+          if (THEME_MAP[payload.theme]) {
+            next.theme = payload.theme;
+          }
+        }
+        return next;
+      });
+    },
+    []
+  );
+
   const { send, status } = useRemoteSocket((msg) => {
+    if (msg.type === "display") {
+      applyDisplaySettings(msg);
+      return;
+    }
     if (msg.type === "index") {
       if (viewMode === "guide") {
         void fetchIndex();
@@ -1165,16 +1291,53 @@ function App() {
     () =>
       ({
         "--slots": Math.min(slotCount, visibleSlotCount),
-        "--row-height": `${ROW_HEIGHT}px`,
-        "--row-gap": `${ROW_GAP}px`,
+        "--row-height": `${ROW_HEIGHT * uiScale}px`,
+        "--row-gap": `${ROW_GAP * uiScale}px`,
+        "--ui-scale": uiScale,
+        ...themeVars,
       } as CSSProperties),
-    [slotCount, visibleSlotCount]
+    [slotCount, visibleSlotCount, uiScale, themeVars]
   );
 
   useEffect(() => {
     const interval = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(interval);
   }, []);
+
+  useEffect(() => {
+    try {
+      const payload: DisplaySettings = {};
+      if (displaySettings.scale !== undefined) {
+        payload.scale = displaySettings.scale;
+      }
+      if (displaySettings.hours !== undefined) {
+        payload.hours = displaySettings.hours;
+      }
+      if (displaySettings.theme !== undefined) {
+        payload.theme = displaySettings.theme;
+      }
+      window.localStorage.setItem(DISPLAY_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // ignore storage errors
+    }
+  }, [displaySettings]);
+
+  useEffect(() => {
+    if (!screenParam) return;
+    setScreenId(screenParam);
+    try {
+      window.localStorage.setItem("chiba:screen", screenParam);
+    } catch {
+      // ignore
+    }
+  }, [screenParam]);
+
+  useEffect(() => {
+    if (!themeParam) return;
+    if (THEME_MAP[themeParam]) {
+      setDisplaySettings((prev) => ({ ...prev, theme: themeParam }));
+    }
+  }, [themeParam]);
 
   useEffect(() => {
     const prev = prevViewModeRef.current;
@@ -1288,6 +1451,26 @@ function App() {
     if (viewMode !== "guide") return;
     const container = previewContainerRef.current;
     if (!container) return;
+    if (PRELOAD_MODE !== "all") {
+      const cacheContainer = ensurePreloadContainer();
+      if (previewAttachedRef.current) {
+        const element = previewAttachedRef.current;
+        element.style.position = "absolute";
+        element.style.left = "-9999px";
+        element.style.top = "0";
+        element.style.width = "1px";
+        element.style.height = "1px";
+        element.style.opacity = "0";
+        element.style.pointerEvents = "none";
+        if (element instanceof HTMLVideoElement) {
+          element.pause();
+        }
+        cacheContainer.appendChild(element);
+        previewAttachedRef.current = null;
+      }
+      setHasPreviewMedia(false);
+      return;
+    }
     const cacheContainer = ensurePreloadContainer();
     const currentUrl = selectedProgram?.url ?? null;
     const cacheEntry = currentUrl
@@ -1373,6 +1556,7 @@ function App() {
       playerChannelIndex ??
       clamp(activeRow, 0, Math.max(0, channels.length - 1));
     if (!Number.isFinite(baseIndex)) return;
+    if (PRELOAD_MODE !== "all") return;
     const neighborRows = [
       (baseIndex - 1 + channels.length) % channels.length,
       (baseIndex + 1) % channels.length,
@@ -1414,6 +1598,11 @@ function App() {
       setPreloadUrl(null);
       return;
     }
+    const kind = getMediaKind(url);
+    if (!shouldPreload(kind)) {
+      setPreloadUrl(null);
+      return;
+    }
     if (preloadTimerRef.current) {
       window.clearTimeout(preloadTimerRef.current);
     }
@@ -1426,10 +1615,17 @@ function App() {
         window.clearTimeout(preloadTimerRef.current);
       }
     };
-  }, [viewMode, playerOpen, selectedProgram?.url, queuePreload]);
+  }, [
+    viewMode,
+    playerOpen,
+    selectedProgram?.url,
+    queuePreload,
+    shouldPreload,
+  ]);
 
   useEffect(() => {
     if (!preloadUrl || playerOpen) return;
+    if (PRELOAD_MODE !== "all") return;
     if (preloadUrl === playerUrl) return;
     setPlayerReady(false);
     setPlayerUrl(preloadUrl);
@@ -1506,16 +1702,24 @@ function App() {
 
   useEffect(() => {
     const updateRows = () => {
+      const nextIsPortrait = window.innerHeight >= window.innerWidth;
       const height = viewportRef.current?.clientHeight ?? 0;
+      setViewportSize({ width: window.innerWidth, height: window.innerHeight });
       if (!height) return;
-      const stride = ROW_HEIGHT + ROW_GAP;
-      const rows = Math.max(3, Math.floor((height + ROW_GAP) / stride));
-      setVisibleRows(rows);
+      const stride = (ROW_HEIGHT + ROW_GAP) * uiScale;
+      const maxRows = nextIsPortrait
+        ? Math.min(3, MAX_VISIBLE_ROWS)
+        : MAX_VISIBLE_ROWS;
+      const minRows = nextIsPortrait
+        ? MIN_VISIBLE_ROWS
+        : Math.max(MIN_VISIBLE_ROWS, 3);
+      const rows = Math.floor((height + ROW_GAP) / stride);
+      setVisibleRows(clamp(rows, minRows, maxRows));
     };
     updateRows();
     window.addEventListener("resize", updateRows);
     return () => window.removeEventListener("resize", updateRows);
-  }, []);
+  }, [uiScale]);
 
   useEffect(() => {
     if (channels.length <= visibleRows) {
@@ -1886,6 +2090,12 @@ function App() {
   const dialOverlayNode = dialOverlay ? (
     <div className="dial-overlay">CH {dialOverlay}</div>
   ) : null;
+  const isRemoteDebug =
+    remoteNowChannel?.id === DEBUG_CHANNEL_ID ||
+    normalizeChannelNumber(remoteNowChannel?.number ?? "") ===
+      normalizeChannelNumber(DEBUG_CHANNEL_NUMBER);
+  const themeIds = THEME_ORDER;
+  const themeIndex = Math.max(0, themeIds.indexOf(activeThemeId));
 
   if (viewMode === "remote") {
     return (
@@ -1901,6 +2111,112 @@ function App() {
               {status === "open" ? "Connected" : "Connecting..."}
             </div>
           </div>
+
+          {isRemoteDebug ? (
+            <div className="remote-display">
+              <div className="remote-display-title">Display Tuning</div>
+              <div className="remote-display-row">
+                <span>Scale</span>
+                <div className="remote-display-controls">
+                  <button
+                    onClick={() =>
+                      send({
+                        type: "display",
+                        scale: Number((uiScale - 0.05).toFixed(2)),
+                      })
+                    }
+                  >
+                    −
+                  </button>
+                  <div className="remote-display-value">
+                    {uiScale.toFixed(2)}×
+                  </div>
+                  <button
+                    onClick={() =>
+                      send({
+                        type: "display",
+                        scale: Number((uiScale + 0.05).toFixed(2)),
+                      })
+                    }
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+              <div className="remote-display-row">
+                <span>Hours</span>
+                <div className="remote-display-controls">
+                  <button
+                    onClick={() =>
+                      send({
+                        type: "display",
+                        hours: Math.max(1, Math.round(visibleHours - 1)),
+                      })
+                    }
+                  >
+                    −
+                  </button>
+                  <div className="remote-display-value">
+                    {Math.round(visibleHours)}h
+                  </div>
+                  <button
+                    onClick={() =>
+                      send({
+                        type: "display",
+                        hours: Math.min(6, Math.round(visibleHours + 1)),
+                      })
+                    }
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+              <div className="remote-display-row">
+                <span>Theme</span>
+                <div className="remote-display-controls">
+                  <button
+                    onClick={() =>
+                      send({
+                        type: "display",
+                        theme:
+                          themeIds[
+                            (themeIndex - 1 + themeIds.length) % themeIds.length
+                          ],
+                      })
+                    }
+                  >
+                    ‹
+                  </button>
+                  <div className="remote-display-value">
+                    {THEME_MAP[activeThemeId]?.label ?? activeThemeId}
+                  </div>
+                  <button
+                    onClick={() =>
+                      send({
+                        type: "display",
+                        theme: themeIds[(themeIndex + 1) % themeIds.length],
+                      })
+                    }
+                  >
+                    ›
+                  </button>
+                </div>
+              </div>
+              <button
+                className="remote-display-reset"
+                onClick={() =>
+                  send({
+                    type: "display",
+                    scale: null,
+                    hours: null,
+                    theme: null,
+                  })
+                }
+              >
+                Reset Display
+              </button>
+            </div>
+          ) : null}
 
           {showGodPanel ? (
             <div className="remote-god-panel">
