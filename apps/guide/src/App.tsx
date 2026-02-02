@@ -150,7 +150,6 @@ function App() {
   const [selectedRow, setSelectedRow] = useState(0);
   const [selectedCol, setSelectedCol] = useState(0);
   const [showQr, setShowQr] = useState(true);
-  const [scrollOffset, setScrollOffset] = useState(0);
   const [visibleRows, setVisibleRows] = useState(6);
   const [artIndex, setArtIndex] = useState(0);
   const [artPaused, setArtPaused] = useState(false);
@@ -188,6 +187,8 @@ function App() {
   const autoResetPendingRef = useRef(false);
   const lastFrameRef = useRef<number | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const rowsRef = useRef<HTMLDivElement | null>(null);
+  const scrollOffsetRef = useRef(0);
   const prevViewModeRef = useRef(viewMode);
   const prevPlayerOpenRef = useRef(playerOpen);
   const prevPausedRef = useRef(false);
@@ -204,7 +205,8 @@ function App() {
     const paddingTop = Number.parseFloat(styles.paddingTop) || 0;
     const paddingBottom = Number.parseFloat(styles.paddingBottom) || 0;
     const innerHeight = Math.max(0, viewport.clientHeight - paddingTop - paddingBottom);
-    const rowsEl = viewport.querySelector<HTMLElement>(".channel-rows");
+    const rowsEl =
+      rowsRef.current ?? viewport.querySelector<HTMLElement>(".channel-rows");
     const rowEl = rowsEl?.querySelector<HTMLElement>(".channel-row");
     const rowHeight = rowEl?.getBoundingClientRect().height ?? ROW_HEIGHT * uiScale;
     const gap =
@@ -377,6 +379,14 @@ function App() {
     dialOverlayTimerRef.current = window.setTimeout(() => {
       setDialOverlay("");
     }, holdMs);
+  }, []);
+
+  const applyScrollOffset = useCallback((value: number) => {
+    scrollOffsetRef.current = value;
+    const target = rowsRef.current;
+    if (target) {
+      target.style.transform = `translateY(-${value}px)`;
+    }
   }, []);
 
   const openProgram = useCallback(
@@ -938,7 +948,7 @@ function App() {
         0,
         Math.max(0, channels.length - visibleRows)
       );
-      setScrollOffset(clamp(desired * bounds.stride, 0, bounds.maxScroll));
+      applyScrollOffset(clamp(desired * bounds.stride, 0, bounds.maxScroll));
       lastFrameRef.current = null;
       prevPausedRef.current = true;
       return;
@@ -952,13 +962,20 @@ function App() {
         0,
         Math.max(0, channels.length - visibleRows)
       );
-      setScrollOffset(clamp(desired * bounds.stride, 0, bounds.maxScroll));
+      applyScrollOffset(clamp(desired * bounds.stride, 0, bounds.maxScroll));
       lastFrameRef.current = null;
       prevPausedRef.current = false;
       return;
     }
     prevPausedRef.current = isPaused;
-  }, [isPaused, channels.length, selectedRow, visibleRows, getScrollBounds]);
+  }, [
+    isPaused,
+    channels.length,
+    selectedRow,
+    visibleRows,
+    getScrollBounds,
+    applyScrollOffset,
+  ]);
 
   useEffect(() => {
     if (viewMode !== "guide") return;
@@ -1062,7 +1079,7 @@ function App() {
   useEffect(() => {
     const bounds = getScrollBounds();
     if (!bounds || channels.length <= visibleRows || bounds.maxScroll <= 0) {
-      setScrollOffset(0);
+      applyScrollOffset(0);
       autoHoldUntilRef.current = 0;
       autoResetPendingRef.current = false;
       return;
@@ -1078,28 +1095,30 @@ function App() {
 
       const nowMs = Date.now();
       if (nowMs >= pauseUntilRef.current) {
-        setScrollOffset((prev) => {
-          if (autoHoldUntilRef.current > nowMs) {
-            return prev;
-          }
-          if (autoResetPendingRef.current) {
-            autoResetPendingRef.current = false;
-            autoHoldUntilRef.current = nowMs + AUTO_SCROLL_END_HOLD_MS;
-            return 0;
-          }
-          if (prev >= maxScroll) {
+        let next = scrollOffsetRef.current;
+        if (autoHoldUntilRef.current > nowMs) {
+          // hold
+        } else if (autoResetPendingRef.current) {
+          autoResetPendingRef.current = false;
+          autoHoldUntilRef.current = nowMs + AUTO_SCROLL_END_HOLD_MS;
+          next = 0;
+        } else if (next >= maxScroll) {
+          autoResetPendingRef.current = true;
+          autoHoldUntilRef.current = nowMs + AUTO_SCROLL_END_HOLD_MS;
+          next = maxScroll;
+        } else {
+          const candidate = next + (AUTO_SCROLL_PX_PER_SEC * delta) / 1000;
+          if (candidate >= maxScroll) {
             autoResetPendingRef.current = true;
             autoHoldUntilRef.current = nowMs + AUTO_SCROLL_END_HOLD_MS;
-            return maxScroll;
+            next = maxScroll;
+          } else {
+            next = candidate;
           }
-          const next = prev + (AUTO_SCROLL_PX_PER_SEC * delta) / 1000;
-          if (next >= maxScroll) {
-            autoResetPendingRef.current = true;
-            autoHoldUntilRef.current = nowMs + AUTO_SCROLL_END_HOLD_MS;
-            return maxScroll;
-          }
-          return next;
-        });
+        }
+        if (next !== scrollOffsetRef.current) {
+          applyScrollOffset(next);
+        }
       }
 
       requestAnimationFrame(tick);
@@ -1110,7 +1129,7 @@ function App() {
       cancelAnimationFrame(raf);
       lastFrameRef.current = null;
     };
-  }, [channels.length, visibleRows, getScrollBounds]);
+  }, [channels.length, visibleRows, getScrollBounds, applyScrollOffset]);
 
   useEffect(() => {
     if (Date.now() < pauseUntilRef.current) {
@@ -1122,9 +1141,15 @@ function App() {
         0,
         Math.max(0, channels.length - visibleRows)
       );
-      setScrollOffset(clamp(desired * bounds.stride, 0, bounds.maxScroll));
+      applyScrollOffset(clamp(desired * bounds.stride, 0, bounds.maxScroll));
     }
-  }, [channels.length, selectedRow, visibleRows, getScrollBounds]);
+  }, [
+    channels.length,
+    selectedRow,
+    visibleRows,
+    getScrollBounds,
+    applyScrollOffset,
+  ]);
 
   useEffect(() => {
     if (viewMode !== "art") return;
@@ -1300,13 +1325,6 @@ function App() {
     send({ type: "app", appId: nextAppId });
   }, [viewMode, playerOpen, activeAppId, send]);
 
-  const rowStyle = useMemo(
-    () =>
-      ({
-        transform: `translateY(-${scrollOffset}px)`,
-      } as CSSProperties),
-    [scrollOffset]
-  );
   useEffect(() => {
     const bounds = getScrollBounds();
     log.debug("scroll-metrics", {
@@ -1422,9 +1440,9 @@ function App() {
         currentSlotIndex={currentSlotIndex}
         channels={channels}
         activeRow={activeRow}
-        rowStyle={rowStyle}
         isPaused={isPaused}
         viewportRef={viewportRef as RefObject<HTMLDivElement>}
+        rowsRef={rowsRef as RefObject<HTMLDivElement>}
         onSelectRow={setSelectedRow}
         onSelectCol={setSelectedCol}
         onOpenProgram={openProgram}

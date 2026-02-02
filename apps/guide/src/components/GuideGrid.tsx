@@ -1,4 +1,4 @@
-import type { CSSProperties, RefObject } from "react";
+import type { RefObject } from "react";
 import {
   DEBUG_CHANNEL_ID,
   DEBUG_CHANNEL_NUMBER,
@@ -15,9 +15,9 @@ type GuideGridProps = {
   currentSlotIndex: number;
   channels: GuideChannel[];
   activeRow: number;
-  rowStyle: CSSProperties;
   isPaused: boolean;
   viewportRef: RefObject<HTMLDivElement>;
+  rowsRef: RefObject<HTMLDivElement>;
   onSelectRow: (row: number) => void;
   onSelectCol: (col: number) => void;
   onOpenProgram: (program: ProgramSlot, channel: GuideChannel) => void;
@@ -34,9 +34,9 @@ export function GuideGrid({
   currentSlotIndex,
   channels,
   activeRow,
-  rowStyle,
   isPaused,
   viewportRef,
+  rowsRef,
   onSelectRow,
   onSelectCol,
   onOpenProgram,
@@ -79,7 +79,7 @@ export function GuideGrid({
       <div className="channel-viewport" ref={viewportRef}>
         <div
           className={`channel-rows ${isPaused ? "is-paused" : "is-auto"}`}
-          style={rowStyle}
+          ref={rowsRef}
         >
           {channels.map((channel, rowIndex) => (
             <div

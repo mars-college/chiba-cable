@@ -34,9 +34,9 @@ type GuideViewProps = {
   currentSlotIndex: number;
   channels: GuideChannel[];
   activeRow: number;
-  rowStyle: CSSProperties;
   isPaused: boolean;
   viewportRef: RefObject<HTMLDivElement>;
+  rowsRef: RefObject<HTMLDivElement>;
   onSelectRow: (row: number) => void;
   onSelectCol: (col: number) => void;
   onOpenProgram: (program: ProgramSlot, channel: GuideChannel) => void;
@@ -74,9 +74,9 @@ export function GuideView({
   currentSlotIndex,
   channels,
   activeRow,
-  rowStyle,
   isPaused,
   viewportRef,
+  rowsRef,
   onSelectRow,
   onSelectCol,
   onOpenProgram,
@@ -123,9 +123,9 @@ export function GuideView({
         currentSlotIndex={currentSlotIndex}
         channels={channels}
         activeRow={activeRow}
-        rowStyle={rowStyle}
         isPaused={isPaused}
         viewportRef={viewportRef}
+        rowsRef={rowsRef}
         onSelectRow={onSelectRow}
         onSelectCol={onSelectCol}
         onOpenProgram={onOpenProgram}
