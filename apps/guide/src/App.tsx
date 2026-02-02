@@ -52,6 +52,7 @@ import {
   DisplayTuningPanel,
   type DisplayTuningPayload,
 } from "./components/DisplayTuningPanel";
+import { SplashScreen } from "./components/SplashScreen";
 import { ArtView } from "./views/ArtView";
 import { GuideView } from "./views/GuideView";
 import { RemoteView } from "./views/RemoteView";
@@ -90,6 +91,8 @@ function App() {
   const textScaleParam = params.get("text") ?? params.get("textScale");
   const hoursParam = params.get("hours");
   const themeParam = params.get("theme");
+  const splashParam = params.get("splash");
+  const noSplashParam = params.get("nosplash");
   const muteParam =
     params.get("muted") ??
     params.get("mute") ??
@@ -108,6 +111,13 @@ function App() {
     if (forcedMuted === null) return base;
     return { ...base, muted: forcedMuted };
   });
+  const splashOverride = parseBooleanParam(splashParam);
+  const skipSplash =
+    parseBooleanParam(noSplashParam) === true || splashOverride === false;
+  const isBaseGuide =
+    viewMode === "guide" &&
+    (window.location.pathname === "/" || window.location.pathname === "");
+  const shouldSplash = viewMode === "guide" && !skipSplash && (isBaseGuide || splashOverride === true);
   const activeThemeId = useMemo(() => {
     const fromParam = themeParam ? themeParam.trim() : "";
     const fromSettings = displaySettings.theme ?? "";
@@ -147,6 +157,8 @@ function App() {
   const [showVolumeHud, setShowVolumeHud] = useState(false);
   const volumeHudTimerRef = useRef<number | null>(null);
   const didVolumeMountRef = useRef(false);
+  const [showSplash, setShowSplash] = useState(() => shouldSplash);
+  const splashTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     saveAudioSettings({ volume: masterVolume, muted: masterMuted });
@@ -170,6 +182,21 @@ function App() {
       }
     };
   }, [masterVolume, masterMuted]);
+
+  useEffect(() => {
+    if (!showSplash) return;
+    if (splashTimerRef.current) {
+      window.clearTimeout(splashTimerRef.current);
+    }
+    splashTimerRef.current = window.setTimeout(() => {
+      setShowSplash(false);
+    }, 4000);
+    return () => {
+      if (splashTimerRef.current) {
+        window.clearTimeout(splashTimerRef.current);
+      }
+    };
+  }, [showSplash]);
   const [indexData, setIndexData] = useState<GuideIndex>(() =>
     ensureSystemChannels(fallbackIndex)
   );
@@ -1486,6 +1513,10 @@ function App() {
         onChange={handleLocalDisplayChange}
       />
     ) : null;
+  const splashOverlay =
+    shouldSplash && viewMode === "guide" ? (
+      <SplashScreen active={showSplash} />
+    ) : null;
 
   if (viewMode === "remote") {
     return (
@@ -1587,6 +1618,7 @@ function App() {
         dialOverlay={dialOverlay}
       />
       {displayTuningOverlay}
+      {splashOverlay}
     </>
   );
 }

@@ -430,6 +430,80 @@ app.get('/village.jpg', (_req, res) => {
   res.send(frame.buffer);
 });
 
+app.get('/village/live', (req, res) => {
+  const hideMask =
+    req.query.mask === '0' ||
+    req.query.mask === 'false' ||
+    req.query.mask === 'off';
+  const sourceUrl = villageCapture.options.url;
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Village Live</title>
+    <style>
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: #0a0f1a;
+      }
+      body {
+        position: relative;
+        overflow: hidden;
+      }
+      #frame {
+        position: absolute;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        border: 0;
+        display: block;
+        background: #0a0f1a;
+      }
+      #mask {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        width: 340px;
+        height: 140px;
+        border-radius: 14px;
+        background: radial-gradient(circle at 30% 30%, rgba(18, 32, 56, 0.98), rgba(8, 14, 24, 0.98));
+        box-shadow: 0 12px 26px rgba(2, 6, 12, 0.6);
+        border: 1px solid rgba(126, 215, 255, 0.18);
+        pointer-events: none;
+      }
+      #status {
+        position: absolute;
+        bottom: 12px;
+        right: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-family: "Alegreya Sans", "Segoe UI", sans-serif;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(230, 240, 255, 0.7);
+        background: rgba(10, 18, 32, 0.6);
+        border: 1px solid rgba(126, 215, 255, 0.25);
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="frame" src="${sourceUrl}" allow="autoplay; fullscreen"></iframe>
+    <div id="mask"></div>
+    <div id="status">Live site</div>
+    <script>
+      if (${hideMask ? 'true' : 'false'}) {
+        const mask = document.getElementById('mask');
+        if (mask) mask.style.display = 'none';
+      }
+    </script>
+  </body>
+</html>`);
+});
+
 app.get('/village', (_req, res) => {
   res.setHeader('Content-Type', 'text/html');
   res.send(`<!doctype html>
