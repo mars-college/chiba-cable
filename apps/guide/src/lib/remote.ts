@@ -1,9 +1,11 @@
+import { PARAM_WS } from "../constants/params";
+
 const QR_BASE =
   "https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=";
 
 export function getWsUrl(): string {
   const params = new URLSearchParams(window.location.search);
-  const wsParam = params.get("ws");
+  const wsParam = params.get(PARAM_WS);
   if (wsParam) return wsParam;
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${protocol}//${window.location.host}/ws`;

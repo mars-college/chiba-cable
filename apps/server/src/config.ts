@@ -26,7 +26,42 @@ export type ChannelManifest = {
   audio_volume?: number;
   audio_offset_min_sec?: number;
   audio_offset_max_sec?: number;
+  embed?: ChannelEmbedConfig;
   programs: ChannelProgram[];
+};
+
+export type ChannelEmbedOverlay = {
+  title?: string;
+  subtitle?: string;
+  hint?: string;
+  qr?: string;
+  button?: string;
+  show_delay_ms?: number;
+  hide_on_message?: boolean;
+  mode?: "center" | "corner";
+};
+
+export type ChannelEmbedMask = {
+  top?: number;
+  right?: number;
+  bottom?: number;
+  left?: number;
+  width?: number;
+  height?: number;
+};
+
+export type ChannelEmbedConfig = {
+  mode?: "iframe" | "proxy";
+  url?: string;
+  allow?: string;
+  sandbox?: string;
+  autoplay_messages?: string[];
+  autoplay_delay_ms?: number;
+  autoplay_retry_ms?: number;
+  autoplay_retries?: number;
+  dismiss_selectors?: string[];
+  mask?: ChannelEmbedMask;
+  overlay?: ChannelEmbedOverlay;
 };
 
 export type ChibaConfig = {
@@ -86,6 +121,63 @@ function normalizeNumber(value: unknown): number | undefined {
   return value;
 }
 
+function normalizeEmbed(value: unknown): ChannelEmbedConfig | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const overlayRaw =
+    raw.overlay && typeof raw.overlay === "object"
+      ? (raw.overlay as Record<string, unknown>)
+      : undefined;
+  const maskRaw =
+    raw.mask && typeof raw.mask === "object"
+      ? (raw.mask as Record<string, unknown>)
+      : undefined;
+  const embed: ChannelEmbedConfig = {
+    mode:
+      raw.mode === "proxy" || raw.mode === "iframe"
+        ? raw.mode
+        : undefined,
+    url: isString(raw.url) ? raw.url : undefined,
+    allow: isString(raw.allow) ? raw.allow : undefined,
+    sandbox: isString(raw.sandbox) ? raw.sandbox : undefined,
+    autoplay_messages: ensureArray(raw.autoplay_messages).filter(isString),
+    autoplay_delay_ms: normalizeNumber(raw.autoplay_delay_ms),
+    autoplay_retry_ms: normalizeNumber(raw.autoplay_retry_ms),
+    autoplay_retries: normalizeNumber(raw.autoplay_retries),
+    dismiss_selectors: ensureArray(raw.dismiss_selectors).filter(isString),
+    mask: maskRaw
+      ? {
+          top: normalizeNumber(maskRaw.top),
+          right: normalizeNumber(maskRaw.right),
+          bottom: normalizeNumber(maskRaw.bottom),
+          left: normalizeNumber(maskRaw.left),
+          width: normalizeNumber(maskRaw.width),
+          height: normalizeNumber(maskRaw.height),
+        }
+      : undefined,
+    overlay: overlayRaw
+      ? {
+          title: isString(overlayRaw.title) ? overlayRaw.title : undefined,
+          subtitle: isString(overlayRaw.subtitle) ? overlayRaw.subtitle : undefined,
+          hint: isString(overlayRaw.hint) ? overlayRaw.hint : undefined,
+          qr: isString(overlayRaw.qr) ? overlayRaw.qr : undefined,
+          button: isString(overlayRaw.button) ? overlayRaw.button : undefined,
+          show_delay_ms: normalizeNumber(overlayRaw.show_delay_ms),
+          hide_on_message:
+            typeof overlayRaw.hide_on_message === "boolean"
+              ? overlayRaw.hide_on_message
+              : undefined,
+          mode:
+            overlayRaw.mode === "corner" || overlayRaw.mode === "center"
+              ? overlayRaw.mode
+              : undefined,
+        }
+      : undefined,
+  };
+  if (!embed.mode && !embed.url) return undefined;
+  return embed;
+}
+
 async function loadChannelManifest(filePath: string): Promise<ChannelManifest> {
   const raw = await fs.readFile(filePath, "utf-8");
   const parsed = toml.parse(raw) as Partial<ChannelManifest> & {
@@ -107,6 +199,7 @@ async function loadChannelManifest(filePath: string): Promise<ChannelManifest> {
     audio_volume: normalizeNumber(parsed.audio_volume),
     audio_offset_min_sec: normalizeNumber(parsed.audio_offset_min_sec),
     audio_offset_max_sec: normalizeNumber(parsed.audio_offset_max_sec),
+    embed: normalizeEmbed(parsed.embed),
     programs,
   };
 }

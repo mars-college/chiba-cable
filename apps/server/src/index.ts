@@ -8,7 +8,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import mime from 'mime-types';
 import { buildIndexFromFile, type GuideIndex } from './index-builder.js';
 import { buildIndexFromConfig } from './index-builder-config.js';
-import { loadConfig, type LoadedConfig } from './config.js';
+import { loadConfig, type ChannelEmbedConfig, type LoadedConfig } from './config.js';
 import { createVillageCapture } from './village-capture.js';
 import { createWeatherstarCapture } from './weatherstar-capture.js';
 
@@ -115,6 +115,415 @@ const recordMediaError = (path?: string | null) => {
     mediaStats.lastPath = path;
     mediaStats.lastRequestAt = Date.now();
   }
+};
+
+const getEmbedConfig = (id: string): ChannelEmbedConfig | null => {
+  const channel = loadedConfig?.channels.find((item) => item.id === id);
+  return channel?.embed ?? null;
+};
+
+const parseBooleanQuery = (value: unknown): boolean => {
+  if (value === undefined || value === null) return false;
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "number") return raw > 0;
+  if (typeof raw !== "string") return false;
+  const normalized = raw.trim().toLowerCase();
+  return ["1", "true", "yes", "on"].includes(normalized);
+};
+
+const buildOverlayHtml = (embed: ChannelEmbedConfig | null) => {
+  if (!embed?.overlay) return { html: '', script: '' };
+  const overlay = embed.overlay;
+  const title = overlay.title ?? 'Broadcast';
+  const subtitle = overlay.subtitle ?? 'Waiting for Signal';
+  const hint = overlay.hint ?? '';
+  const qr = overlay.qr ?? '';
+  const button = overlay.button ?? 'Hide Info';
+  const showDelay = Math.max(0, overlay.show_delay_ms ?? 0);
+  const hideOnMessage = overlay.hide_on_message !== false;
+  const mode = overlay.mode === 'corner' ? 'corner' : 'center';
+  const qrImg = qr
+    ? `<img class="embed-qr" src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=0&data=${encodeURIComponent(
+        qr
+      )}" alt="QR to broadcast" />`
+    : '';
+  const html = `
+    <div id="embed-overlay" class="embed-overlay ${mode}">
+      <div class="embed-panel">
+        <div class="embed-title">${title}</div>
+        <div class="embed-subtitle">${subtitle}</div>
+        ${qrImg}
+        ${hint ? `<div class="embed-hint">${hint}</div>` : ''}
+        <button class="embed-dismiss" id="embed-dismiss">${button}</button>
+      </div>
+    </div>`;
+  const script = `
+    const overlay = document.getElementById('embed-overlay');
+    const dismiss = document.getElementById('embed-dismiss');
+    const showOverlay = () => overlay?.classList.add('is-visible');
+    const hideOverlay = () => overlay?.classList.remove('is-visible');
+    if (dismiss) dismiss.addEventListener('click', hideOverlay);
+    if (${showDelay} > 0) {
+      setTimeout(showOverlay, ${showDelay});
+    } else {
+      showOverlay();
+    }
+    if (${hideOnMessage}) {
+      window.addEventListener('message', () => hideOverlay());
+    }
+  `;
+  return { html, script };
+};
+
+const buildEmbedPage = (embed: ChannelEmbedConfig, debug = false) => {
+  const allow =
+    embed.allow ?? 'autoplay; fullscreen; camera; microphone';
+  const sandbox = embed.sandbox ? `sandbox="${embed.sandbox}"` : '';
+  const mask = embed.mask;
+  const maskStyle = mask
+    ? `#embed-mask {display:block; top:${mask.top ?? 8}px; right:${mask.right ?? 8}px; bottom:${mask.bottom ?? 'auto'}; left:${mask.left ?? 'auto'}; width:${mask.width ?? 340}px; height:${mask.height ?? 140}px;}`
+    : '#embed-mask {display:none;}';
+  const { html: overlayHtml, script: overlayScript } = buildOverlayHtml(embed);
+  const autoplayMessages = embed.autoplay_messages ?? [];
+  const autoplayDelay = Math.max(0, embed.autoplay_delay_ms ?? 800);
+  const autoplayRetryMs = Math.max(0, embed.autoplay_retry_ms ?? 1500);
+  const autoplayRetries = Math.max(0, embed.autoplay_retries ?? 3);
+  const debugEnabled = Boolean(debug);
+  const debugMeta = JSON.stringify({
+    url: embed.url ?? "",
+    mode: embed.mode ?? "iframe",
+  });
+  const debugPanel = debugEnabled
+    ? `<div id="embed-debug" class="embed-debug"><div class="embed-debug-title">Embed Debug</div><div id="embed-debug-lines" class="embed-debug-lines"></div></div>`
+    : "";
+  const debugSetup = `
+    const debugEnabled = ${debugEnabled};
+    const debugLines = debugEnabled ? document.getElementById('embed-debug-lines') : null;
+    const debugLog = (label, detail) => {
+      if (!debugEnabled || !debugLines) return;
+      const line = document.createElement('div');
+      let detailText = '';
+      if (detail !== undefined) {
+        if (typeof detail === 'string') {
+          detailText = detail;
+        } else {
+          try { detailText = JSON.stringify(detail); } catch { detailText = String(detail); }
+        }
+      }
+      line.textContent = detailText ? \`[\${label}] \${detailText}\` : \`[\${label}]\`;
+      debugLines.prepend(line);
+      while (debugLines.children.length > 14) {
+        debugLines.removeChild(debugLines.lastChild);
+      }
+    };
+    if (debugEnabled) debugLog('init', ${debugMeta});
+  `;
+  const autoplayScript =
+    autoplayMessages.length > 0
+      ? `
+      const autoplayMessages = ${JSON.stringify(autoplayMessages)};
+      const autoplayDelay = ${autoplayDelay};
+      const autoplayRetryMs = ${autoplayRetryMs};
+      const autoplayRetries = ${autoplayRetries};
+      let autoplayAttempts = 0;
+      const sendAutoplay = () => {
+        if (!frame || !frame.contentWindow) return;
+        autoplayMessages.forEach((msg) => {
+          frame.contentWindow.postMessage({ action: msg }, '*');
+          frame.contentWindow.postMessage({ command: msg }, '*');
+          frame.contentWindow.postMessage(msg, '*');
+        });
+      };
+      const tryAutoplay = () => {
+        if (autoplayAttempts >= autoplayRetries) return;
+        autoplayAttempts += 1;
+        debugLog('autoplay', { attempt: autoplayAttempts });
+        sendAutoplay();
+        setTimeout(tryAutoplay, autoplayRetryMs);
+      };
+      setTimeout(tryAutoplay, autoplayDelay);
+      `
+      : '';
+  return `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Channel Embed</title>
+    <style>
+      html, body { height: 100%; margin: 0; background: #0a0f1a; }
+      body { position: relative; overflow: hidden; font-family: "Oxanium", "Segoe UI", sans-serif; color: #e9f5ff; }
+      #embed-frame { position: absolute; inset: 0; width: 100vw; height: 100vh; border: 0; display: block; background: #0a0f1a; }
+      #embed-mask {
+        position: absolute;
+        border-radius: 14px;
+        background: radial-gradient(circle at 30% 30%, rgba(18, 32, 56, 0.98), rgba(8, 14, 24, 0.98));
+        box-shadow: 0 12px 26px rgba(2, 6, 12, 0.6);
+        border: 1px solid rgba(126, 215, 255, 0.18);
+        pointer-events: none;
+      }
+      ${maskStyle}
+      .embed-overlay {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at 50% 30%, rgba(40, 80, 140, 0.55), rgba(6, 10, 18, 0.96));
+        opacity: 0;
+        transition: opacity 220ms ease;
+        pointer-events: none;
+      }
+      .embed-overlay.is-visible { opacity: 1; }
+      .embed-overlay.corner {
+        background: transparent;
+        display: flex;
+        align-items: flex-start;
+        justify-content: flex-end;
+        padding: 24px;
+      }
+      .embed-panel {
+        max-width: min(720px, 90vw);
+        padding: 28px;
+        border-radius: 18px;
+        background: linear-gradient(160deg, rgba(18, 30, 54, 0.96), rgba(8, 14, 24, 0.98));
+        border: 1px solid rgba(126, 215, 255, 0.35);
+        box-shadow: 0 20px 40px rgba(2, 6, 12, 0.6);
+        display: grid;
+        gap: 16px;
+        text-align: center;
+        pointer-events: auto;
+      }
+      .embed-overlay.corner .embed-panel {
+        max-width: min(360px, 44vw);
+        padding: 18px;
+        gap: 12px;
+        text-align: center;
+      }
+      .embed-title {
+        font-size: 1.4rem;
+        letter-spacing: 0.3em;
+        text-transform: uppercase;
+      }
+      .embed-overlay.corner .embed-title {
+        font-size: 0.95rem;
+        letter-spacing: 0.22em;
+      }
+      .embed-subtitle {
+        color: rgba(200, 220, 255, 0.75);
+        font-size: 0.9rem;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+      }
+      .embed-overlay.corner .embed-subtitle {
+        font-size: 0.7rem;
+      }
+      .embed-qr {
+        margin: 0 auto;
+        width: 200px;
+        height: 200px;
+        border-radius: 14px;
+        padding: 8px;
+        background: rgba(6, 10, 18, 0.85);
+        border: 1px solid rgba(126, 215, 255, 0.3);
+      }
+      .embed-overlay.corner .embed-qr {
+        width: 150px;
+        height: 150px;
+      }
+      .embed-hint {
+        font-size: 0.8rem;
+        color: rgba(200, 220, 255, 0.8);
+      }
+      .embed-overlay.corner .embed-hint {
+        font-size: 0.7rem;
+      }
+      .embed-dismiss {
+        justify-self: center;
+        padding: 8px 18px;
+        border-radius: 999px;
+        border: 1px solid rgba(126, 215, 255, 0.4);
+        background: rgba(12, 20, 36, 0.85);
+        color: #e9f5ff;
+        font-size: 0.7rem;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+      .embed-debug {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        max-width: min(360px, 90vw);
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(6, 10, 18, 0.78);
+        border: 1px solid rgba(126, 215, 255, 0.35);
+        font-size: 12px;
+        color: rgba(230, 240, 255, 0.92);
+        z-index: 5;
+        pointer-events: none;
+      }
+      .embed-debug-title {
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        font-size: 10px;
+        margin-bottom: 6px;
+      }
+      .embed-debug-lines {
+        display: grid;
+        gap: 4px;
+        font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+        font-size: 10px;
+        color: rgba(160, 210, 255, 0.9);
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="embed-frame" src="${embed.url ?? ''}" allow="${allow}" ${sandbox}></iframe>
+    <div id="embed-mask"></div>
+    ${overlayHtml}
+    ${debugPanel}
+    <script>
+      const frame = document.getElementById('embed-frame');
+      ${debugSetup}
+      if (frame && debugEnabled) {
+        frame.addEventListener('load', () => debugLog('iframe', 'load'));
+      }
+      window.addEventListener('message', (event) => {
+        if (debugEnabled) debugLog('message', event.data);
+      });
+      ${autoplayScript}
+      ${overlayScript}
+    </script>
+  </body>
+</html>`;
+};
+
+const buildProxyPage = (
+  html: string,
+  embed: ChannelEmbedConfig,
+  debug?: { enabled: boolean; status?: number; url?: string }
+) => {
+  const selectors = embed.dismiss_selectors ?? [];
+  const hideCss = selectors.length
+    ? selectors.map((sel) => `${sel}{display:none !important; visibility:hidden !important;}`).join('')
+    : '';
+  const baseHref = embed.url ?? '';
+  const debugEnabled = Boolean(debug?.enabled);
+  const debugStatus =
+    typeof debug?.status === 'number' ? debug.status : 'unknown';
+  const debugUrl = debug?.url ?? embed.url ?? '';
+  const debugStyle = debugEnabled
+    ? `
+      #embed-debug {
+        position: fixed;
+        bottom: 12px;
+        left: 12px;
+        z-index: 2147483647;
+        max-width: min(420px, 94vw);
+        padding: 10px 12px;
+        border-radius: 12px;
+        background: rgba(6, 10, 18, 0.82);
+        border: 1px solid rgba(126, 215, 255, 0.35);
+        font-family: "JetBrains Mono", "SFMono-Regular", ui-monospace, monospace;
+        font-size: 11px;
+        color: rgba(220, 235, 255, 0.92);
+        pointer-events: none;
+      }
+    `
+    : '';
+  const debugScript = debugEnabled
+    ? `
+      <script>
+        (() => {
+          const meta = ${JSON.stringify({ status: debugStatus, url: debugUrl })};
+          const panel = document.createElement('div');
+          panel.id = 'embed-debug';
+          panel.textContent = \`Embed proxy: \${meta.status} \${meta.url}\`;
+          const mount = () => document.body && document.body.appendChild(panel);
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', mount);
+          } else {
+            mount();
+          }
+        })();
+      </script>
+    `
+    : '';
+  const injectScript = `
+      <script>
+        (() => {
+          const baseOrigin = window.location.origin;
+          const normalizeUrlArg = (url) => {
+            if (!url) return url;
+            if (typeof url === 'string') return url;
+            if (typeof url === 'object' && url.href) return url.href;
+            try {
+              return String(url);
+            } catch {
+              return null;
+            }
+          };
+          const safeHistory = (original) => function (state, title, url) {
+            try {
+              const normalized = normalizeUrlArg(url);
+              if (typeof normalized === 'string' && normalized.length > 0) {
+                const parsed = new URL(normalized, window.location.href);
+                if (parsed.origin !== baseOrigin) {
+                  const safeUrl = parsed.pathname + parsed.search + parsed.hash;
+                  return original.call(this, state, title, safeUrl);
+                }
+                return original.call(this, state, title, normalized);
+              }
+              return original.call(this, state, title, url);
+            } catch {
+              return;
+            }
+          };
+          try {
+            if (History && History.prototype && History.prototype.replaceState) {
+              History.prototype.replaceState = safeHistory(History.prototype.replaceState);
+            }
+            if (History && History.prototype && History.prototype.pushState) {
+              History.prototype.pushState = safeHistory(History.prototype.pushState);
+            }
+          } catch {
+            // ignore history override failures
+          }
+          const selectors = ${JSON.stringify(selectors)};
+          const remove = () => {
+            selectors.forEach((sel) => {
+              document.querySelectorAll(sel).forEach((node) => node.remove());
+            });
+            document.documentElement.style.overflow = 'auto';
+            document.body.style.overflow = 'auto';
+          };
+          const ready = () => {
+            remove();
+            if (selectors.length) {
+              const observer = new MutationObserver(remove);
+              observer.observe(document.body, { childList: true, subtree: true });
+            }
+          };
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', ready);
+          } else {
+            ready();
+          }
+        })();
+      </script>
+    `;
+  let output = html.replace(/<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+  output = output.replace(/<base[^>]*>/gi, '');
+  const injection = `<base href="${baseHref}"/><style>${hideCss}${debugStyle}</style>${injectScript}${debugScript}`;
+  if (/<head[^>]*>/i.test(output)) {
+    output = output.replace(/<head[^>]*>/i, (match) => `${match}${injection}`);
+  } else {
+    output = `${injection}${output}`;
+  }
+  return output;
 };
 
 const broadcast = (message: string) => {
@@ -568,6 +977,165 @@ app.get('/village', (_req, res) => {
       });
       tick();
       setInterval(tick, refreshMs);
+    </script>
+  </body>
+</html>`);
+});
+
+app.get('/embed/:id', async (req, res) => {
+  const embed = getEmbedConfig(req.params.id);
+  if (!embed?.url) {
+    res.status(404).send('embed_not_found');
+    return;
+  }
+  const embedDebug = parseBooleanQuery(req.query.embed_debug);
+  if (embed.mode === 'proxy') {
+    try {
+      const upstream = await fetch(embed.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (ChibaCable)' },
+      });
+      const html = await upstream.text();
+      if (embedDebug) {
+        console.log(
+          `[embed] proxy ${req.params.id} ${upstream.status} (${embed.url})`
+        );
+      }
+      res.setHeader('Content-Type', 'text/html');
+      res.send(
+        buildProxyPage(html, embed, {
+          enabled: embedDebug,
+          status: upstream.status,
+          url: embed.url,
+        })
+      );
+    } catch (err) {
+      res.status(502).send(`embed_proxy_failed: ${(err as Error).message}`);
+    }
+    return;
+  }
+  res.setHeader('Content-Type', 'text/html');
+  res.send(buildEmbedPage(embed, embedDebug));
+});
+
+app.get('/mars', (_req, res) => {
+  const viewUrl =
+    'https://vdo.ninja/?view=QQA3g6X316&room=Mars_Public_Access_Network&pw=marscollege&scene&api=1';
+  const pushUrl =
+    'https://vdo.ninja/?push=QQA3g6X316&room=Mars_Public_Access_Network&pw=marscollege';
+  const qrUrl =
+    'https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=0&data=' +
+    encodeURIComponent(pushUrl);
+  res.setHeader('Content-Type', 'text/html');
+  res.send(`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mars Public Access Network</title>
+    <style>
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: #0a0f1a;
+      }
+      body {
+        position: relative;
+        overflow: hidden;
+        font-family: "Oxanium", "Segoe UI", sans-serif;
+        color: #e9f5ff;
+      }
+      #frame {
+        position: absolute;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        border: 0;
+        display: block;
+        background: #0a0f1a;
+      }
+      #overlay {
+        position: absolute;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        background: radial-gradient(circle at 50% 30%, rgba(40, 80, 140, 0.55), rgba(6, 10, 18, 0.96));
+        color: #e9f5ff;
+        opacity: 0;
+        transition: opacity 220ms ease;
+        pointer-events: none;
+      }
+      #overlay.is-visible {
+        opacity: 1;
+        pointer-events: auto;
+      }
+      .panel {
+        max-width: min(720px, 90vw);
+        padding: 28px;
+        border-radius: 18px;
+        background: linear-gradient(160deg, rgba(18, 30, 54, 0.96), rgba(8, 14, 24, 0.98));
+        border: 1px solid rgba(126, 215, 255, 0.35);
+        box-shadow: 0 20px 40px rgba(2, 6, 12, 0.6);
+        display: grid;
+        gap: 16px;
+        text-align: center;
+      }
+      .title {
+        font-size: 1.4rem;
+        letter-spacing: 0.3em;
+        text-transform: uppercase;
+      }
+      .subtitle {
+        color: rgba(200, 220, 255, 0.75);
+        font-size: 0.9rem;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+      }
+      .qr {
+        margin: 0 auto;
+        width: 200px;
+        height: 200px;
+        border-radius: 14px;
+        padding: 8px;
+        background: rgba(6, 10, 18, 0.85);
+        border: 1px solid rgba(126, 215, 255, 0.3);
+      }
+      .hint {
+        font-size: 0.8rem;
+        color: rgba(200, 220, 255, 0.8);
+      }
+      .dismiss {
+        justify-self: center;
+        padding: 8px 18px;
+        border-radius: 999px;
+        border: 1px solid rgba(126, 215, 255, 0.4);
+        background: rgba(12, 20, 36, 0.85);
+        color: #e9f5ff;
+        font-size: 0.7rem;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <iframe id="frame" src="${viewUrl}" allow="autoplay; fullscreen; microphone; camera"></iframe>
+    <div id="overlay" class="is-visible">
+      <div class="panel">
+        <div class="title">Mars Public Access Network</div>
+        <div class="subtitle">Waiting for Broadcast</div>
+        <img class="qr" src="${qrUrl}" alt="QR to broadcast" />
+        <div class="hint">Scan to join and broadcast via VDO Ninja.</div>
+        <button class="dismiss" id="dismiss">Hide Info</button>
+      </div>
+    </div>
+    <script>
+      const overlay = document.getElementById('overlay');
+      const dismiss = document.getElementById('dismiss');
+      const show = () => overlay.classList.add('is-visible');
+      const hide = () => overlay.classList.remove('is-visible');
+      dismiss.addEventListener('click', hide);
+      window.addEventListener('message', () => hide());
+      setTimeout(() => show(), 4000);
     </script>
   </body>
 </html>`);

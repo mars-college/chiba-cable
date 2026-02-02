@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useMemo } from "react";
 import { createLogger } from "../lib/logger";
 import type {
   GuideChannel,
@@ -61,6 +61,27 @@ export function PlayerOverlay({
     log.debug("state", { url: playerUrl, kind: playerKind, open: playerOpen });
   }, [playerUrl, playerKind, playerOpen]);
 
+  const iframePolicy = useMemo(() => {
+    if (!playerUrl) {
+      return {
+        allow: "autoplay; fullscreen",
+        sandbox: "allow-scripts allow-same-origin allow-pointer-lock",
+      };
+    }
+    const isTrusted =
+      playerUrl.startsWith("/mars") ||
+      playerUrl.startsWith("/village/live") ||
+      playerUrl.startsWith("/embed/");
+    return {
+      allow: isTrusted
+        ? "autoplay; fullscreen; camera; microphone"
+        : "autoplay; fullscreen",
+      sandbox: isTrusted
+        ? undefined
+        : "allow-scripts allow-same-origin allow-pointer-lock",
+    };
+  }, [playerUrl]);
+
   useEffect(() => {
     if (!ambientAudio?.url || !playerOpen) {
       setAmbientOffsetSec(null);
@@ -87,12 +108,19 @@ export function PlayerOverlay({
     const audio = ambientAudioRef.current;
     if (!audio) return;
     const base =
-      typeof ambientAudio?.volume === "number" && Number.isFinite(ambientAudio.volume)
+      typeof ambientAudio?.volume === "number" &&
+      Number.isFinite(ambientAudio.volume)
         ? ambientAudio.volume
         : 1;
     audio.volume = Math.min(1, Math.max(0, base * masterVolume));
     audio.muted = masterMuted || !playerOpen;
-  }, [ambientAudio?.volume, ambientAudio?.url, masterVolume, masterMuted, playerOpen]);
+  }, [
+    ambientAudio?.volume,
+    ambientAudio?.url,
+    masterVolume,
+    masterMuted,
+    playerOpen,
+  ]);
 
   useEffect(() => {
     const audio = mediaAudioRef.current;
@@ -114,7 +142,9 @@ export function PlayerOverlay({
     const seek = () => {
       if (didSeekRef.current) return;
       try {
-        const duration = Number.isFinite(audio.duration) ? audio.duration : null;
+        const duration = Number.isFinite(audio.duration)
+          ? audio.duration
+          : null;
         audio.currentTime =
           duration && duration > 0 ? Math.min(target, duration - 0.5) : target;
         didSeekRef.current = true;
@@ -183,8 +213,8 @@ export function PlayerOverlay({
             className="player-frame"
             src={playerUrl}
             title={playerMeta?.title ?? "Program"}
-            allow="autoplay; fullscreen"
-            sandbox="allow-scripts allow-same-origin allow-pointer-lock"
+            allow={iframePolicy.allow}
+            sandbox={iframePolicy.sandbox}
             onLoad={() => {
               log.info("loaded", { url: playerUrl, kind: "iframe" });
               setPlayerReady(true);

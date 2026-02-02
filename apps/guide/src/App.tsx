@@ -34,6 +34,22 @@ import {
   UI_SCALE_MIN,
   USER_PAUSE_MS,
 } from "./constants/guide";
+import {
+  PARAM_ART_INDEX,
+  PARAM_EMBED_DEBUG,
+  PARAM_HOURS,
+  PARAM_MUTE_KEYS,
+  PARAM_NO_SPLASH,
+  PARAM_REMOTE_APP_KEYS,
+  PARAM_REMOTE_HOST,
+  PARAM_REMOTE_HTTPS,
+  PARAM_RETURN_ROW,
+  PARAM_SCALE,
+  PARAM_SCREEN_KEYS,
+  PARAM_SPLASH,
+  PARAM_TEXT_SCALE_KEYS,
+  PARAM_THEME,
+} from "./constants/params";
 import { usePreloadManager } from "./hooks/usePreloadManager";
 import { useRemoteControls } from "./hooks/useRemoteControls";
 import { useRemoteSocket } from "./hooks/useRemoteSocket";
@@ -46,8 +62,14 @@ import {
 } from "./lib/guide";
 import { createLogger } from "./lib/logger";
 import { getAppIdFromUrl, getMediaKind } from "./lib/media";
+import { appendQueryParam, getFirstParam, parseBooleanParam } from "./lib/queryParams";
 import { buildRemoteUrls } from "./lib/remote";
-import { loadAudioSettings, loadDisplaySettings, loadScreenId, saveAudioSettings } from "./lib/storage";
+import {
+  loadAudioSettings,
+  loadDisplaySettings,
+  loadScreenId,
+  saveAudioSettings,
+} from "./lib/storage";
 import {
   DisplayTuningPanel,
   type DisplayTuningPayload,
@@ -70,14 +92,6 @@ import type {
 
 const log = createLogger("guide-app");
 
-function parseBooleanParam(value: string | null): boolean | null {
-  if (!value) return null;
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "off"].includes(normalized)) return false;
-  return null;
-}
-
 function App() {
   const isRemote = window.location.pathname.startsWith("/remote");
   const channelId = window.location.pathname.startsWith("/channel/")
@@ -85,20 +99,17 @@ function App() {
     : null;
   const params = useMemo(() => new URLSearchParams(window.location.search), []);
   const viewMode: ViewMode = isRemote ? "remote" : channelId ? "art" : "guide";
-  const returnRowParam = Number(params.get("r") ?? "");
-  const requestedRemoteAppId = params.get("app") ?? params.get("appId") ?? "";
-  const scaleParam = params.get("scale");
-  const textScaleParam = params.get("text") ?? params.get("textScale");
-  const hoursParam = params.get("hours");
-  const themeParam = params.get("theme");
-  const splashParam = params.get("splash");
-  const noSplashParam = params.get("nosplash");
-  const muteParam =
-    params.get("muted") ??
-    params.get("mute") ??
-    params.get("audioMuted") ??
-    params.get("audio");
-  const screenParam = params.get("screen") ?? params.get("screenId");
+  const returnRowParam = Number(params.get(PARAM_RETURN_ROW) ?? "");
+  const requestedRemoteAppId = getFirstParam(params, PARAM_REMOTE_APP_KEYS) ?? "";
+  const scaleParam = params.get(PARAM_SCALE);
+  const textScaleParam = getFirstParam(params, PARAM_TEXT_SCALE_KEYS);
+  const hoursParam = params.get(PARAM_HOURS);
+  const themeParam = params.get(PARAM_THEME);
+  const splashParam = params.get(PARAM_SPLASH);
+  const noSplashParam = params.get(PARAM_NO_SPLASH);
+  const muteParam = getFirstParam(params, PARAM_MUTE_KEYS);
+  const screenParam = getFirstParam(params, PARAM_SCREEN_KEYS);
+  const embedDebugParam = params.get(PARAM_EMBED_DEBUG);
   const [, setScreenId] = useState(() =>
     screenParam ? screenParam : loadScreenId()
   );
@@ -114,6 +125,7 @@ function App() {
   const splashOverride = parseBooleanParam(splashParam);
   const skipSplash =
     parseBooleanParam(noSplashParam) === true || splashOverride === false;
+  const embedDebugEnabled = parseBooleanParam(embedDebugParam) === true;
   const isBaseGuide =
     viewMode === "guide" &&
     (window.location.pathname === "/" || window.location.pathname === "");
@@ -190,7 +202,7 @@ function App() {
     }
     splashTimerRef.current = window.setTimeout(() => {
       setShowSplash(false);
-    }, 4000);
+    }, 4500);
     return () => {
       if (splashTimerRef.current) {
         window.clearTimeout(splashTimerRef.current);
@@ -388,6 +400,19 @@ function App() {
       offsetMaxSec: playerChannel.audioOffsetMaxSec,
     };
   }, [playerOpen, playerChannel]);
+  const decorateProgramUrl = useCallback(
+    (url: string | null) => {
+      if (!url) return url;
+      if (!embedDebugEnabled) return url;
+      if (!url.startsWith("/embed/")) return url;
+      return appendQueryParam(url, PARAM_EMBED_DEBUG, "1");
+    },
+    [embedDebugEnabled]
+  );
+  const selectedProgramUrl = useMemo(
+    () => decorateProgramUrl(selectedProgram?.url ?? null),
+    [decorateProgramUrl, selectedProgram?.url]
+  );
   const activeAppId = useMemo(() => getAppIdFromUrl(playerUrl), [playerUrl]);
   const playerKind = useMemo(
     () => (playerUrl ? getMediaKind(playerUrl) : null),
@@ -400,7 +425,7 @@ function App() {
     previewContainerRef,
   } = usePreloadManager({
     viewMode,
-    selectedProgramUrl: selectedProgram?.url ?? null,
+    selectedProgramUrl,
     selectedChannelPreviewUrl: selectedChannel?.previewUrl ?? null,
     playerOpen,
     playerUrl,
@@ -487,10 +512,12 @@ function App() {
   const openProgram = useCallback(
     (program: ProgramSlot, channel: GuideChannel) => {
       if (!program.url) return;
+      const programUrl = decorateProgramUrl(program.url);
+      if (!programUrl) return;
       setPlayerOpen(true);
-      if (playerUrl !== program.url) {
+      if (playerUrl !== programUrl) {
         setPlayerReady(false);
-        setPlayerUrl(program.url);
+        setPlayerUrl(programUrl);
       }
       setShowPlayerHud(false);
       const channelIndex = channels.findIndex((item) => item.id === channel.id);
@@ -509,7 +536,7 @@ function App() {
         url: program.url,
       });
     },
-    [playerUrl, channels, activeRow]
+    [decorateProgramUrl, playerUrl, channels, activeRow]
   );
 
   const handleChannelChange = useCallback(
@@ -1301,7 +1328,7 @@ function App() {
 
   useEffect(() => {
     if (viewMode !== "art") return;
-    const raw = Number(params.get("i") ?? "");
+    const raw = Number(params.get(PARAM_ART_INDEX) ?? "");
     if (!Number.isFinite(raw)) return;
     const artItems =
       channels
@@ -1453,8 +1480,8 @@ function App() {
     return ratio * 100;
   }, [now, selectedProgram, indexData.startTime, indexData.slotMinutes]);
 
-  const hostOverride = params.get("host");
-  const forceHttps = params.get("https") === "1";
+  const hostOverride = params.get(PARAM_REMOTE_HOST);
+  const forceHttps = params.get(PARAM_REMOTE_HTTPS) === "1";
   const metaRemote =
     document.querySelector<HTMLMetaElement>('meta[name="remote-url"]')
       ?.content ?? "";

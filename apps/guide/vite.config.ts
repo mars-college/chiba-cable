@@ -1,10 +1,12 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
-import reactScan from "@react-scan/vite-plugin-react-scan";
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), reactScan()],
+  plugins: [
+    react(),
+    // reactScan()
+  ],
   server: {
     proxy: {
       "/api": {
@@ -23,6 +25,12 @@ export default defineConfig({
         target: "http://localhost:8787",
       },
       "/weatherstar.jpg": {
+        target: "http://localhost:8787",
+      },
+      "/mars": {
+        target: "http://localhost:8787",
+      },
+      "/embed": {
         target: "http://localhost:8787",
       },
       "/ws": {

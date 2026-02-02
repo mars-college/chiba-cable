@@ -1,3 +1,5 @@
+import { PARAM_LOG_LEVEL } from "../constants/params";
+
 type LogLevel = "debug" | "info" | "warn" | "error";
 
 const LEVEL_RANK: Record<LogLevel, number> = {
@@ -34,7 +36,7 @@ const getLogLevel = (): LogLevel | null => {
     return import.meta.env.DEV ? "debug" : "warn";
   }
   const params = new URLSearchParams(window.location.search);
-  const paramLevel = parseLevel(params.get("log"));
+  const paramLevel = parseLevel(params.get(PARAM_LOG_LEVEL));
   if (paramLevel !== null) return paramLevel;
   try {
     const stored = parseLevel(window.localStorage.getItem(STORAGE_KEY));
