@@ -19,5 +19,10 @@ export default defineConfig([
       ecmaVersion: 2020,
       globals: globals.browser,
     },
+    rules: {
+      // Disable React Compiler rules - these flag common valid patterns
+      // like setState in effects for syncing state from props/URL
+      'react-hooks/set-state-in-effect': 'off',
+    },
   },
 ])
