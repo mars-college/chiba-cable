@@ -21,6 +21,10 @@ export type ChannelIndex = {
   description?: string;
   accent: string;
   previewUrl?: string;
+  audioUrl?: string;
+  audioVolume?: number;
+  audioOffsetMinSec?: number;
+  audioOffsetMaxSec?: number;
   schedule: ProgramSlot[];
 };
 
@@ -158,6 +162,15 @@ export function buildIndexFromConfig(loaded: LoadedConfig): GuideIndex {
   });
 
   const channelIndex: ChannelIndex[] = sortedChannels.map((channel) => ({
+    audioUrl:
+      channel.audio_source?.type === "path"
+        ? mediaUrlForPath(channel.audio_source.value)
+        : channel.audio_source?.type === "url"
+        ? channel.audio_source.value
+        : undefined,
+    audioVolume: channel.audio_volume,
+    audioOffsetMinSec: channel.audio_offset_min_sec,
+    audioOffsetMaxSec: channel.audio_offset_max_sec,
     id: channel.id,
     number: channel.number,
     name: channel.name,

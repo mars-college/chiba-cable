@@ -11,6 +11,8 @@ import "./App.css";
 import { DEFAULT_THEME_ID, THEME_MAP } from "./themes";
 import { fallbackIndex } from "./data/fallbackIndex";
 import {
+  AUDIO_VOLUME_DEFAULT,
+  AUDIO_VOLUME_STEP,
   AUTO_SCROLL_END_HOLD_MS,
   AUTO_SCROLL_PX_PER_SEC,
   DEBUG_CHANNEL_ID,
@@ -45,7 +47,7 @@ import {
 import { createLogger } from "./lib/logger";
 import { getAppIdFromUrl, getMediaKind } from "./lib/media";
 import { buildRemoteUrls } from "./lib/remote";
-import { loadDisplaySettings, loadScreenId } from "./lib/storage";
+import { loadAudioSettings, loadDisplaySettings, loadScreenId, saveAudioSettings } from "./lib/storage";
 import {
   DisplayTuningPanel,
   type DisplayTuningPayload,
@@ -60,11 +62,20 @@ import type {
   MediaDebugStats,
   PlayerMeta,
   ProgramSlot,
+  AudioSettings,
   RemoteMessage,
   ViewMode,
 } from "./types/guide";
 
 const log = createLogger("guide-app");
+
+function parseBooleanParam(value: string | null): boolean | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return null;
+}
 
 function App() {
   const isRemote = window.location.pathname.startsWith("/remote");
@@ -79,6 +90,11 @@ function App() {
   const textScaleParam = params.get("text") ?? params.get("textScale");
   const hoursParam = params.get("hours");
   const themeParam = params.get("theme");
+  const muteParam =
+    params.get("muted") ??
+    params.get("mute") ??
+    params.get("audioMuted") ??
+    params.get("audio");
   const screenParam = params.get("screen") ?? params.get("screenId");
   const [, setScreenId] = useState(() =>
     screenParam ? screenParam : loadScreenId()
@@ -86,6 +102,12 @@ function App() {
   const [displaySettings, setDisplaySettings] = useState<DisplaySettings>(() =>
     loadDisplaySettings()
   );
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>(() => {
+    const base = loadAudioSettings();
+    const forcedMuted = parseBooleanParam(muteParam);
+    if (forcedMuted === null) return base;
+    return { ...base, muted: forcedMuted };
+  });
   const activeThemeId = useMemo(() => {
     const fromParam = themeParam ? themeParam.trim() : "";
     const fromSettings = displaySettings.theme ?? "";
@@ -110,12 +132,44 @@ function App() {
     if (!Number.isFinite(raw)) return TEXT_SCALE_DEFAULT;
     return clamp(raw, TEXT_SCALE_MIN, TEXT_SCALE_MAX);
   }, [textScaleParam, displaySettings.textScale]);
+  const masterVolume = useMemo(() => {
+    const raw = audioSettings.volume;
+    if (!Number.isFinite(raw)) return AUDIO_VOLUME_DEFAULT;
+    return clamp(raw, 0, 1);
+  }, [audioSettings.volume]);
+  const masterMuted = audioSettings.muted ?? false;
 
   const [now, setNow] = useState(() => new Date());
   const [viewportSize, setViewportSize] = useState(() => ({
     width: window.innerWidth,
     height: window.innerHeight,
   }));
+  const [showVolumeHud, setShowVolumeHud] = useState(false);
+  const volumeHudTimerRef = useRef<number | null>(null);
+  const didVolumeMountRef = useRef(false);
+
+  useEffect(() => {
+    saveAudioSettings({ volume: masterVolume, muted: masterMuted });
+  }, [masterVolume, masterMuted]);
+
+  useEffect(() => {
+    if (!didVolumeMountRef.current) {
+      didVolumeMountRef.current = true;
+      return;
+    }
+    setShowVolumeHud(true);
+    if (volumeHudTimerRef.current) {
+      window.clearTimeout(volumeHudTimerRef.current);
+    }
+    volumeHudTimerRef.current = window.setTimeout(() => {
+      setShowVolumeHud(false);
+    }, 1400);
+    return () => {
+      if (volumeHudTimerRef.current) {
+        window.clearTimeout(volumeHudTimerRef.current);
+      }
+    };
+  }, [masterVolume, masterMuted]);
   const [indexData, setIndexData] = useState<GuideIndex>(() =>
     ensureSystemChannels(fallbackIndex)
   );
@@ -293,6 +347,20 @@ function App() {
     ) ??
     selectedChannel?.schedule[0] ??
     null;
+  const playerChannel = useMemo(() => {
+    if (playerChannelIndex === null) return selectedChannel;
+    return channels[playerChannelIndex] ?? selectedChannel;
+  }, [playerChannelIndex, channels, selectedChannel]);
+  const ambientAudio = useMemo(() => {
+    if (!playerOpen) return null;
+    if (!playerChannel?.audioUrl) return null;
+    return {
+      url: playerChannel.audioUrl,
+      volume: playerChannel.audioVolume,
+      offsetMinSec: playerChannel.audioOffsetMinSec,
+      offsetMaxSec: playerChannel.audioOffsetMaxSec,
+    };
+  }, [playerOpen, playerChannel]);
   const activeAppId = useMemo(() => getAppIdFromUrl(playerUrl), [playerUrl]);
   const playerKind = useMemo(
     () => (playerUrl ? getMediaKind(playerUrl) : null),
@@ -605,6 +673,32 @@ function App() {
     []
   );
 
+  const setMuted = useCallback((next?: boolean) => {
+    setAudioSettings((prev) => {
+      const currentMuted = prev.muted ?? false;
+      const muted = typeof next === "boolean" ? next : !currentMuted;
+      const baseVolume =
+        Number.isFinite(prev.volume) ? prev.volume : AUDIO_VOLUME_DEFAULT;
+      return {
+        volume: clamp(baseVolume, 0, 1),
+        muted,
+      };
+    });
+  }, []);
+
+  const adjustVolume = useCallback((dir: "up" | "down") => {
+    setAudioSettings((prev) => {
+      const baseVolume =
+        Number.isFinite(prev.volume) ? prev.volume : AUDIO_VOLUME_DEFAULT;
+      const delta = dir === "up" ? AUDIO_VOLUME_STEP : -AUDIO_VOLUME_STEP;
+      const volume = clamp(baseVolume + delta, 0, 1);
+      return {
+        volume,
+        muted: false,
+      };
+    });
+  }, []);
+
   const { send, status } = useRemoteSocket((msg) => {
     if (msg.type === "display") {
       applyDisplaySettings(msg);
@@ -613,6 +707,18 @@ function App() {
     if (msg.type === "index") {
       if (viewMode === "guide") {
         void fetchIndex();
+      }
+      return;
+    }
+    if (msg.type === "volume") {
+      if (viewMode !== "remote") {
+        adjustVolume(msg.dir);
+      }
+      return;
+    }
+    if (msg.type === "mute") {
+      if (viewMode !== "remote") {
+        setMuted(msg.muted);
       }
       return;
     }
@@ -1211,6 +1317,18 @@ function App() {
         setShowDebug((prev) => !prev);
         return;
       }
+      if (viewMode !== "remote" && (key === "m" || key === "M")) {
+        event.preventDefault();
+        setMuted();
+        return;
+      }
+      const volumeUp = key === "+" || key === "=";
+      const volumeDown = key === "-" || key === "_";
+      if (viewMode !== "remote" && (volumeUp || volumeDown)) {
+        event.preventDefault();
+        adjustVolume(volumeUp ? "up" : "down");
+        return;
+      }
       if (playerOpen && (key === "i" || key === "I")) {
         setShowPlayerHud((prev) => !prev);
         return;
@@ -1279,6 +1397,7 @@ function App() {
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
   }, [
+    adjustVolume,
     moveSelection,
     viewMode,
     channels,
@@ -1286,6 +1405,7 @@ function App() {
     handleSelect,
     playerOpen,
     handleChannelChange,
+    setMuted,
   ]);
 
   const progressValue = useMemo(() => {
@@ -1412,6 +1532,9 @@ function App() {
           memoryStats={memoryStats}
           mediaStats={mediaStats}
           dialOverlay={dialOverlay}
+          masterVolume={masterVolume}
+          masterMuted={masterMuted}
+          showVolumeHud={showVolumeHud}
         />
         {displayTuningOverlay}
       </>
@@ -1453,6 +1576,10 @@ function App() {
         playerKind={playerKind}
         playerMeta={playerMeta}
         showPlayerHud={showPlayerHud}
+        ambientAudio={ambientAudio}
+        masterVolume={masterVolume}
+        masterMuted={masterMuted}
+        showVolumeHud={showVolumeHud}
         setPlayerReady={setPlayerReady}
         showDebug={showDebug}
         memoryStats={memoryStats}

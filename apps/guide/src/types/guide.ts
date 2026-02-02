@@ -17,6 +17,10 @@ export type GuideChannel = {
   description?: string;
   accent: string;
   previewUrl?: string;
+  audioUrl?: string;
+  audioVolume?: number;
+  audioOffsetMinSec?: number;
+  audioOffsetMaxSec?: number;
   schedule: ProgramSlot[];
 };
 
@@ -58,6 +62,11 @@ export type DisplaySettings = {
   textScale?: number;
   hours?: number;
   theme?: string;
+};
+
+export type AudioSettings = {
+  volume: number;
+  muted: boolean;
 };
 
 export type MediaKind = "image" | "video" | "audio" | "iframe";
@@ -104,6 +113,8 @@ export type RemoteMessage =
   | { type: "channel"; dir: "up" | "down" }
   | { type: "tune"; number: string }
   | { type: "dial"; value: string; committed?: boolean }
+  | { type: "volume"; dir: "up" | "down" }
+  | { type: "mute"; muted?: boolean }
   | { type: "select" }
   | { type: "guide" }
   | { type: "info" }

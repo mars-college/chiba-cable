@@ -1,5 +1,6 @@
 import { DebugPanel, type MemoryStats } from "../components/DebugPanel";
 import { DialOverlay } from "../components/DialOverlay";
+import { VolumeHud } from "../components/VolumeHud";
 import type {
   GuideChannel,
   MediaDebugStats,
@@ -15,6 +16,9 @@ type ArtViewProps = {
   memoryStats: MemoryStats | null;
   mediaStats: MediaDebugStats | null;
   dialOverlay: string;
+  masterVolume: number;
+  masterMuted: boolean;
+  showVolumeHud: boolean;
 };
 
 export function ArtView({
@@ -26,6 +30,9 @@ export function ArtView({
   memoryStats,
   mediaStats,
   dialOverlay,
+  masterVolume,
+  masterMuted,
+  showVolumeHud,
 }: ArtViewProps) {
   const artChannel =
     channels.find((channel) => channel.id === (channelId ?? "jensen-art")) ??
@@ -51,6 +58,11 @@ export function ArtView({
           {artPaused ? "Paused" : "Auto"} - arrows to navigate, space to pause
         </div>
       </div>
+      <VolumeHud
+        volume={masterVolume}
+        muted={masterMuted}
+        visible={showVolumeHud}
+      />
       <DebugPanel show={showDebug} memoryStats={memoryStats} mediaStats={mediaStats} />
       <DialOverlay value={dialOverlay} />
     </div>

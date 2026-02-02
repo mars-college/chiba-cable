@@ -5,6 +5,7 @@ import { GuideFooter } from "../components/GuideFooter";
 import { GuideGrid } from "../components/GuideGrid";
 import { GuideHeader } from "../components/GuideHeader";
 import { PlayerOverlay } from "../components/PlayerOverlay";
+import { VolumeHud } from "../components/VolumeHud";
 import type {
   GuideChannel,
   GuideIndex,
@@ -47,6 +48,15 @@ type GuideViewProps = {
   playerKind: MediaKind | null;
   playerMeta: PlayerMeta | null;
   showPlayerHud: boolean;
+  ambientAudio: {
+    url: string;
+    volume?: number;
+    offsetMinSec?: number;
+    offsetMaxSec?: number;
+  } | null;
+  masterVolume: number;
+  masterMuted: boolean;
+  showVolumeHud: boolean;
   setPlayerReady: (ready: boolean) => void;
   showDebug: boolean;
   memoryStats: MemoryStats | null;
@@ -87,6 +97,10 @@ export function GuideView({
   playerKind,
   playerMeta,
   showPlayerHud,
+  ambientAudio,
+  masterVolume,
+  masterMuted,
+  showVolumeHud,
   setPlayerReady,
   showDebug,
   memoryStats,
@@ -134,6 +148,12 @@ export function GuideView({
 
       <GuideFooter selectedChannel={selectedChannel} />
 
+      <VolumeHud
+        volume={masterVolume}
+        muted={masterMuted}
+        visible={showVolumeHud}
+      />
+
       {showQr ? (
         <div className="qr-card">
           <div className="qr-label">Scan for Remote</div>
@@ -150,6 +170,9 @@ export function GuideView({
         selectedChannel={selectedChannel}
         selectedProgram={selectedProgram}
         showPlayerHud={showPlayerHud}
+        ambientAudio={ambientAudio}
+        masterVolume={masterVolume}
+        masterMuted={masterMuted}
         setPlayerReady={setPlayerReady}
       />
 

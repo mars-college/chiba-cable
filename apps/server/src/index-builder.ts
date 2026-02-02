@@ -17,6 +17,10 @@ export type SourceChannel = {
   description?: string;
   accent?: string;
   previewUrl?: string;
+  audioUrl?: string;
+  audioVolume?: number;
+  audioOffsetMinSec?: number;
+  audioOffsetMaxSec?: number;
   programs: SourceProgram[];
 };
 
@@ -46,6 +50,10 @@ export type ChannelIndex = {
   description?: string;
   accent: string;
   previewUrl?: string;
+  audioUrl?: string;
+  audioVolume?: number;
+  audioOffsetMinSec?: number;
+  audioOffsetMaxSec?: number;
   schedule: ProgramSlot[];
 };
 
@@ -125,6 +133,10 @@ export async function buildIndexFromFile(filePath: string): Promise<GuideIndex> 
     description: channel.description,
     accent: channel.accent ?? '#7ed7ff',
     previewUrl: channel.previewUrl,
+    audioUrl: channel.audioUrl,
+    audioVolume: channel.audioVolume,
+    audioOffsetMinSec: channel.audioOffsetMinSec,
+    audioOffsetMaxSec: channel.audioOffsetMaxSec,
     schedule: buildSchedule(channel.programs, config.slotCount, config.slotMinutes),
   }));
 

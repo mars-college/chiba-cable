@@ -22,6 +22,10 @@ export type ChannelManifest = {
   call_sign: string;
   accent?: string;
   description?: string;
+  audio_source?: ChannelProgramSource;
+  audio_volume?: number;
+  audio_offset_min_sec?: number;
+  audio_offset_max_sec?: number;
   programs: ChannelProgram[];
 };
 
@@ -77,6 +81,11 @@ function normalizePrograms(programs: ChannelProgram[] | undefined): ChannelProgr
   }));
 }
 
+function normalizeNumber(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  return value;
+}
+
 async function loadChannelManifest(filePath: string): Promise<ChannelManifest> {
   const raw = await fs.readFile(filePath, "utf-8");
   const parsed = toml.parse(raw) as Partial<ChannelManifest> & {
@@ -94,6 +103,10 @@ async function loadChannelManifest(filePath: string): Promise<ChannelManifest> {
     call_sign: parsed.call_sign ?? "",
     accent: parsed.accent,
     description: parsed.description,
+    audio_source: parsed.audio_source,
+    audio_volume: normalizeNumber(parsed.audio_volume),
+    audio_offset_min_sec: normalizeNumber(parsed.audio_offset_min_sec),
+    audio_offset_max_sec: normalizeNumber(parsed.audio_offset_max_sec),
     programs,
   };
 }

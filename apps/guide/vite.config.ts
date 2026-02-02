@@ -1,32 +1,31 @@
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
-import reactScan from '@react-scan/vite-plugin-react-scan';
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
 // https://vite.dev/config/
 export default defineConfig({
-  plugins: [react(), reactScan()],
+  plugins: [react()],
   server: {
     proxy: {
-      '/api': {
-        target: 'http://localhost:8787',
+      "/api": {
+        target: "http://localhost:8787",
       },
-      '/media': {
-        target: 'http://localhost:8787',
+      "/media": {
+        target: "http://localhost:8787",
       },
-      '/village': {
-        target: 'http://localhost:8787',
+      "/village": {
+        target: "http://localhost:8787",
       },
-      '/village.jpg': {
-        target: 'http://localhost:8787',
+      "/village.jpg": {
+        target: "http://localhost:8787",
       },
-      '/weatherstar': {
-        target: 'http://localhost:8787',
+      "/weatherstar": {
+        target: "http://localhost:8787",
       },
-      '/weatherstar.jpg': {
-        target: 'http://localhost:8787',
+      "/weatherstar.jpg": {
+        target: "http://localhost:8787",
       },
-      '/ws': {
-        target: 'ws://localhost:8787',
+      "/ws": {
+        target: "ws://localhost:8787",
         ws: true,
       },
     },

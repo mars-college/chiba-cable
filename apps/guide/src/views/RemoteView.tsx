@@ -311,9 +311,13 @@ export function RemoteView({
               </div>
 
               <div className="rocker">
-                <button disabled>VOL UP</button>
+                <button onClick={() => send({ type: "volume", dir: "up" })}>
+                  VOL UP
+                </button>
                 <span>VOL</span>
-                <button disabled>VOL DOWN</button>
+                <button onClick={() => send({ type: "volume", dir: "down" })}>
+                  VOL DOWN
+                </button>
               </div>
             </div>
 
@@ -350,7 +354,7 @@ export function RemoteView({
             <div className="remote-actions">
               <button onClick={() => send({ type: "guide" })}>Guide</button>
               <button onClick={() => send({ type: "info" })}>Info</button>
-              <button onClick={() => setDialBuffer("")}>Back</button>
+              <button onClick={() => send({ type: "mute" })}>Mute</button>
             </div>
 
             <button
