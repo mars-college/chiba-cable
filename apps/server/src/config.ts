@@ -68,6 +68,7 @@ export type ChibaConfig = {
   server?: {
     host?: string;
     port?: number;
+    remote_url?: string;
   };
   library: {
     roots: string[];

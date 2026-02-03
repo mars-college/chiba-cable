@@ -1485,11 +1485,41 @@ function App() {
   const metaRemote =
     document.querySelector<HTMLMetaElement>('meta[name="remote-url"]')
       ?.content ?? "";
+  const [remoteOverride, setRemoteOverride] = useState<{
+    baseUrl: string;
+    remoteUrl: string;
+    qrUrl: string;
+  } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const guidePort =
+      window.location.port && window.location.port.length > 0
+        ? window.location.port
+        : window.location.protocol === "https:"
+          ? "443"
+          : "80";
+    const scheme = window.location.protocol.replace(":", "");
+    fetch(`/api/remote?guide_port=${guidePort}&scheme=${scheme}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!alive || !data?.baseUrl || !data?.qrUrl) return;
+        setRemoteOverride({
+          baseUrl: data.baseUrl as string,
+          remoteUrl: data.remoteUrl as string,
+          qrUrl: data.qrUrl as string,
+        });
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
   const { qrUrl } = buildRemoteUrls({
     hostOverride,
     forceHttps,
-    metaRemote,
+    metaRemote: remoteOverride?.baseUrl ?? metaRemote,
   });
+  const qrImageUrl = remoteOverride?.qrUrl ?? qrUrl;
 
   useEffect(() => {
     if (viewMode !== "guide") return;
@@ -1629,7 +1659,7 @@ function App() {
         onOpenProgram={openProgram}
         onToggleDebug={() => setShowDebug((prev) => !prev)}
         showQr={showQr}
-        qrUrl={qrUrl}
+        qrUrl={qrImageUrl}
         playerUrl={playerUrl}
         playerKind={playerKind}
         playerMeta={playerMeta}

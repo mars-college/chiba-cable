@@ -156,7 +156,7 @@ export function GuideView({
 
       {showQr ? (
         <div className="qr-card">
-          <div className="qr-label">Scan for Remote</div>
+          <div className="qr-label">Remote</div>
           <img className="qr-image" src={qrUrl} alt="Remote QR code" />
         </div>
       ) : null}

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
+import os from 'node:os';
 import express from 'express';
 import { WebSocketServer, WebSocket } from 'ws';
 import mime from 'mime-types';
@@ -675,6 +676,27 @@ app.get('/api/debug/media', (_req, res) => {
   });
 });
 
+app.get('/api/remote', (req, res) => {
+  const rawPort = req.query.guide_port ?? req.query.port;
+  const guidePort =
+    typeof rawPort === 'string' && rawPort.trim().length > 0
+      ? Number(rawPort)
+      : Array.isArray(rawPort) && typeof rawPort[0] === 'string'
+        ? Number(rawPort[0])
+        : null;
+  const port = Number.isFinite(guidePort) ? guidePort : null;
+  const scheme =
+    typeof req.query.scheme === 'string'
+      ? req.query.scheme.replace(':', '')
+      : Array.isArray(req.query.scheme) && typeof req.query.scheme[0] === 'string'
+        ? req.query.scheme[0].replace(':', '')
+        : null;
+  const baseUrl = getRemoteBaseUrl(req, { port, scheme });
+  const remoteUrl = `${baseUrl}/remote`;
+  const qrUrl = `${QR_BASE}${encodeURIComponent(remoteUrl)}`;
+  res.json({ baseUrl, remoteUrl, qrUrl });
+});
+
 function isPathAllowed(target: string): boolean {
   if (!mediaRoots.length) return false;
   const resolved = path.resolve(target);
@@ -1233,11 +1255,71 @@ function getBaseUrl(req: express.Request): string {
   return `${scheme}://${host}`;
 }
 
+const QR_BASE =
+  'https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=0&data=';
+
+type RemoteBaseOptions = {
+  scheme?: string | null;
+  port?: number | null;
+};
+
+function getLanAddress(): string | null {
+  const nets = os.networkInterfaces();
+  const candidates: Array<{ addr: string; score: number }> = [];
+  for (const entries of Object.values(nets)) {
+    for (const info of entries ?? []) {
+      if (!info) continue;
+      if (info.family !== 'IPv4' || info.internal) continue;
+      const addr = info.address;
+      if (addr.startsWith('169.254.')) continue;
+      let score = 1;
+      if (addr.startsWith('192.168.')) score = 4;
+      else if (addr.startsWith('10.')) score = 3;
+      else if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(addr)) score = 3;
+      else if (addr.startsWith('100.')) score = 2;
+      candidates.push({ addr, score });
+    }
+  }
+  if (!candidates.length) return null;
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.addr ?? null;
+}
+
+function normalizeRemoteBase(input: string, fallback: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return fallback;
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `http://${trimmed}`;
+}
+
+function getRemoteBaseUrl(
+  req: express.Request,
+  options: RemoteBaseOptions = {}
+): string {
+  const configured =
+    loadedConfig?.config?.server?.remote_url ??
+    process.env.CHIBA_REMOTE_URL ??
+    '';
+  const fallback = getBaseUrl(req);
+  if (configured) {
+    return normalizeRemoteBase(configured, fallback);
+  }
+  const scheme =
+    options.scheme ??
+    (req.socket.encrypted ? 'https' : 'http');
+  const port = options.port ?? PORT;
+  const lan = getLanAddress();
+  if (lan) {
+    return `${scheme}://${lan}${port ? `:${port}` : ''}`;
+  }
+  return fallback;
+}
+
 async function sendIndex(req: express.Request, res: express.Response) {
   try {
     const html = await fsp.readFile(indexFile, 'utf-8');
-    const baseUrl = getBaseUrl(req);
-    const payload = html.replace('__REMOTE_URL__', baseUrl);
+    const remoteBaseUrl = getRemoteBaseUrl(req, { port: PORT });
+    const payload = html.replace('__REMOTE_URL__', remoteBaseUrl);
     res.setHeader('Content-Type', 'text/html');
     res.send(payload);
   } catch (err) {
